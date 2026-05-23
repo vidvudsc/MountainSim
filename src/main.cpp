@@ -25,7 +25,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace {
@@ -163,11 +162,6 @@ private:
 
 class Terrain {
 public:
-    struct FlowPath {
-        std::vector<glm::vec3> points;
-        float phase = 0.0f;
-    };
-
     Terrain()
     {
         generate(settings_);
@@ -180,8 +174,11 @@ public:
         heights_.assign(kTerrainSize * kTerrainSize, 0.0f);
         water_.assign(kTerrainSize * kTerrainSize, 0.0f);
         sediment_.assign(kTerrainSize * kTerrainSize, 0.0f);
+        displayWater_.assign(kTerrainSize * kTerrainSize, 0.0f);
+        displaySediment_.assign(kTerrainSize * kTerrainSize, 0.0f);
         hasErosionFlow_ = false;
-        flowPaths_.clear();
+        liveDroplets_.clear();
+        particlePositions_.clear();
 
         float minHeight = 1e9f;
         float maxHeight = -1e9f;
@@ -227,86 +224,90 @@ public:
         finishErosionPass();
     }
 
-    void beginAnimatedErosion(int plannedDrops)
+    void beginLiveErosion(int plannedDrops)
     {
         beginErosionPass(plannedDrops);
         rebuildVertices();
     }
 
-    void erodeAnimatedStep(int drops, bool finish)
+    int spawnLiveDroplets(int requested, int maxActive)
     {
-        if (drops <= 0) return;
-        erodeDrops(drops);
-        smoothHeightmap(1, finish ? 0.055f : 0.018f);
+        if (requested <= 0 || maxActive <= 0) return 0;
+        std::uniform_real_distribution<float> dist(1.0f, static_cast<float>(kTerrainSize - 2));
+        int available = std::max(0, maxActive - static_cast<int>(liveDroplets_.size()));
+        int spawned = std::min(requested, available);
+        liveDroplets_.reserve(static_cast<std::size_t>(maxActive));
+        for (int i = 0; i < spawned; ++i) {
+            Droplet droplet{};
+            droplet.x = dist(erosionRng_);
+            droplet.z = dist(erosionRng_);
+            droplet.speed = 1.0f;
+            droplet.water = 1.0f;
+            droplet.alive = true;
+            liveDroplets_.push_back(droplet);
+        }
+        return spawned;
+    }
+
+    void stepLiveDroplets(float speedScale)
+    {
+        if (liveDroplets_.empty()) {
+            particlePositions_.clear();
+            return;
+        }
+        speedScale = glm::clamp(speedScale, 0.06f, 1.0f);
+        for (Droplet& droplet : liveDroplets_) {
+            if (droplet.alive) advanceDroplet(droplet, speedScale);
+        }
+        liveDroplets_.erase(
+            std::remove_if(liveDroplets_.begin(), liveDroplets_.end(), [](const Droplet& droplet) { return !droplet.alive; }),
+            liveDroplets_.end()
+        );
+        particlePositions_.clear();
+        particlePositions_.reserve(liveDroplets_.size());
+        for (const Droplet& droplet : liveDroplets_) particlePositions_.push_back(terrainPoint(droplet.x, droplet.z));
+        hasErosionFlow_ = hasErosionFlow_ || !particlePositions_.empty();
         rebuildVertices();
-        hasErosionFlow_ = true;
-        rebuildFlowPaths();
-        if (finish) finishErosionPass();
+    }
+
+    void finishLiveErosion()
+    {
+        particlePositions_.clear();
+        liveDroplets_.clear();
+        finishErosionPass();
     }
 
     void beginErosionPass(int salt)
     {
-        ++erosionPass_;
-        erosionRng_.seed(static_cast<std::uint32_t>(settings_.seed * 1664525u + erosionPass_ * 1013904223u + static_cast<std::uint32_t>(salt)));
+        auto now = static_cast<std::uint32_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        std::random_device entropy;
+        erosionRng_.seed(static_cast<std::uint32_t>(settings_.seed * 1664525u + static_cast<std::uint32_t>(salt) * 1013904223u + now + entropy()));
         std::fill(water_.begin(), water_.end(), 0.0f);
         std::fill(sediment_.begin(), sediment_.end(), 0.0f);
         hasErosionFlow_ = false;
-        flowPaths_.clear();
+        liveDroplets_.clear();
+        particlePositions_.clear();
     }
 
     void finishErosionPass()
     {
-        normalizeHydro();
+        updateHydroDisplay();
         smoothHeightmap(2, 0.075f);
         rebuildVertices();
         hasErosionFlow_ = true;
-        rebuildFlowPaths();
     }
 
     void erodeDrops(int drops)
     {
         std::uniform_real_distribution<float> dist(1.0f, static_cast<float>(kTerrainSize - 2));
         for (int i = 0; i < drops; ++i) {
-            float x = dist(erosionRng_);
-            float z = dist(erosionRng_);
-            glm::vec2 dir(0.0f);
-            float speed = 1.0f;
-            float water = 1.0f;
-            float sediment = 0.0f;
-            for (int lifetime = 0; lifetime < 42; ++lifetime) {
-                HeightSample current = sampleHeightAndGradient(x, z);
-                dir = dir * settings_.inertia - current.gradient * (1.0f - settings_.inertia);
-                float len = glm::length(dir);
-                if (len < 0.001f) {
-                    float angle = dist(erosionRng_) * 17.31f;
-                    dir = glm::vec2(std::cos(angle), std::sin(angle));
-                } else {
-                    dir /= len;
-                }
-                float nextX = x + dir.x;
-                float nextZ = z + dir.y;
-                if (nextX < 1.0f || nextX >= kTerrainSize - 2 || nextZ < 1.0f || nextZ >= kTerrainSize - 2) break;
-                float nextHeight = sampleHeight(nextX, nextZ);
-                float deltaHeight = nextHeight - current.height;
-                float capacity = std::max(-deltaHeight * speed * water * settings_.capacity, settings_.minCapacity);
-                if (sediment > capacity || deltaHeight > 0.0f) {
-                    float amount = deltaHeight > 0.0f ? std::min(deltaHeight, sediment) : (sediment - capacity) * settings_.depositSpeed;
-                    sediment -= amount;
-                    deposit(x, z, amount);
-                } else {
-                    float amount = std::min((capacity - sediment) * settings_.erodeSpeed, -deltaHeight);
-                    if (amount > 0.0f) {
-                        erodeAt(x, z, amount, settings_.erosionRadius);
-                        sediment += amount;
-                    }
-                }
-                addHydro(x, z, water * 0.025f, sediment * 0.015f);
-                speed = std::sqrt(std::max(0.0f, speed * speed + deltaHeight * settings_.gravity));
-                water *= (1.0f - settings_.evaporation);
-                x = nextX;
-                z = nextZ;
-                if (water < 0.02f) break;
-            }
+            Droplet droplet{};
+            droplet.x = dist(erosionRng_);
+            droplet.z = dist(erosionRng_);
+            droplet.speed = 1.0f;
+            droplet.water = 1.0f;
+            droplet.alive = true;
+            while (droplet.alive) advanceDroplet(droplet, 1.0f);
         }
     }
 
@@ -314,17 +315,13 @@ public:
     {
         smoothHeightmap(1, 0.16f);
         rebuildVertices();
-        if (hasErosionFlow_) {
-            rebuildFlowPaths();
-        } else {
-            flowPaths_.clear();
-        }
+        particlePositions_.clear();
     }
 
     const std::vector<Vertex>& vertices() const { return vertices_; }
     const std::vector<std::uint32_t>& indices() const { return indices_; }
-    const std::vector<FlowPath>& flowPaths() const { return flowPaths_; }
-    bool hasErosionFlow() const { return hasErosionFlow_; }
+    const std::vector<glm::vec3>& particlePositions() const { return particlePositions_; }
+    bool hasActiveDroplets() const { return !liveDroplets_.empty(); }
     TerrainSettings& settings() { return settings_; }
     const TerrainSettings& settings() const { return settings_; }
 
@@ -348,6 +345,17 @@ private:
     struct HeightSample {
         float height = 0.0f;
         glm::vec2 gradient{};
+    };
+
+    struct Droplet {
+        float x = 0.0f;
+        float z = 0.0f;
+        glm::vec2 dir{0.0f};
+        float speed = 1.0f;
+        float water = 1.0f;
+        float sediment = 0.0f;
+        float age = 0.0f;
+        bool alive = false;
     };
 
     static int idx(int x, int z) { return z * kTerrainSize + x; }
@@ -454,26 +462,76 @@ private:
         sediment_[idx(ix, iz)] += sedimentAmount;
     }
 
-    void normalizeHydro()
+    void advanceDroplet(Droplet& droplet, float stepScale)
     {
-        auto percentile = [](const std::vector<float>& values, float p) {
-            std::vector<float> sorted;
-            sorted.reserve(values.size());
-            for (float v : values) {
-                if (v > 0.0f) sorted.push_back(v);
+        if (!droplet.alive) return;
+        stepScale = glm::clamp(stepScale, 0.06f, 1.0f);
+        HeightSample current = sampleHeightAndGradient(droplet.x, droplet.z);
+        droplet.dir = droplet.dir * settings_.inertia - current.gradient * (1.0f - settings_.inertia);
+        float len = glm::length(droplet.dir);
+        if (len < 0.001f) {
+            std::uniform_real_distribution<float> angleDist(0.0f, 6.28318f);
+            float angle = angleDist(erosionRng_);
+            droplet.dir = glm::vec2(std::cos(angle), std::sin(angle));
+        } else {
+            droplet.dir /= len;
+        }
+
+        float nextX = droplet.x + droplet.dir.x * stepScale;
+        float nextZ = droplet.z + droplet.dir.y * stepScale;
+        if (nextX < 1.0f || nextX >= kTerrainSize - 2 || nextZ < 1.0f || nextZ >= kTerrainSize - 2) {
+            droplet.alive = false;
+            return;
+        }
+
+        float nextHeight = sampleHeight(nextX, nextZ);
+        float deltaHeight = nextHeight - current.height;
+        float capacity = std::max(-deltaHeight * droplet.speed * droplet.water * settings_.capacity, settings_.minCapacity);
+        if (droplet.sediment > capacity || deltaHeight > 0.0f) {
+            float amount = (deltaHeight > 0.0f ? std::min(deltaHeight, droplet.sediment) : (droplet.sediment - capacity) * settings_.depositSpeed) * stepScale;
+            droplet.sediment -= amount;
+            deposit(droplet.x, droplet.z, amount);
+        } else {
+            float amount = std::min((capacity - droplet.sediment) * settings_.erodeSpeed, -deltaHeight) * stepScale;
+            if (amount > 0.0f) {
+                erodeAt(droplet.x, droplet.z, amount, settings_.erosionRadius);
+                droplet.sediment += amount;
             }
-            if (sorted.empty()) return 1.0f;
-            std::sort(sorted.begin(), sorted.end());
-            std::size_t index = static_cast<std::size_t>(glm::clamp(p, 0.0f, 1.0f) * static_cast<float>(sorted.size() - 1));
-            return std::max(sorted[index], 0.001f);
-        };
-        float waterScale = percentile(water_, 0.985f);
-        float sedimentScale = percentile(sediment_, 0.980f);
+        }
+
+        addHydro(droplet.x, droplet.z, droplet.water * 0.028f * stepScale, droplet.sediment * 0.017f * stepScale);
+        droplet.speed = std::sqrt(std::max(0.0f, droplet.speed * droplet.speed + deltaHeight * settings_.gravity * stepScale));
+        droplet.water *= std::pow(1.0f - settings_.evaporation, stepScale);
+        droplet.x = nextX;
+        droplet.z = nextZ;
+        droplet.age += stepScale;
+        if (droplet.water < 0.02f || droplet.age >= 46.0f) droplet.alive = false;
+    }
+
+    float hydroPercentile(const std::vector<float>& values, float p) const
+    {
+        std::vector<float> sorted;
+        sorted.reserve(values.size());
+        for (float v : values) {
+            if (v > 0.0f) sorted.push_back(v);
+        }
+        if (sorted.empty()) return 1.0f;
+        std::sort(sorted.begin(), sorted.end());
+        std::size_t index = static_cast<std::size_t>(glm::clamp(p, 0.0f, 1.0f) * static_cast<float>(sorted.size() - 1));
+        return std::max(sorted[index], 0.001f);
+    }
+
+    void updateHydroDisplay()
+    {
+        displayWater_.resize(water_.size());
+        displaySediment_.resize(sediment_.size());
+        float waterScale = hydroPercentile(water_, 0.990f);
+        float sedimentScale = hydroPercentile(sediment_, 0.985f);
         for (int i = 0; i < static_cast<int>(water_.size()); ++i) {
             float water = glm::clamp(water_[i] / waterScale, 0.0f, 1.0f);
             float sediment = glm::clamp(sediment_[i] / sedimentScale, 0.0f, 1.0f);
-            water_[i] = std::pow(smoothstep01((water - 0.10f) / 0.90f), 0.72f);
-            sediment_[i] = std::pow(smoothstep01((sediment - 0.08f) / 0.92f), 0.82f);
+            displayWater_[i] = std::pow(smoothstep01((water - 0.16f) / 0.84f), 1.08f);
+            displaySediment_[i] = std::pow(smoothstep01((sediment - 0.06f) / 0.94f), 0.76f);
         }
     }
 
@@ -498,6 +556,7 @@ private:
     void rebuildVertices()
     {
         float step = kTerrainWorldSize / static_cast<float>(kTerrainSize - 1);
+        updateHydroDisplay();
         vertices_.assign(kTerrainSize * kTerrainSize, Vertex{});
         indices_.clear();
         indices_.reserve((kTerrainSize - 1) * (kTerrainSize - 1) * 12);
@@ -506,7 +565,7 @@ private:
                 int index = idx(x, z);
                 vertices_[index].position = gridToWorld(static_cast<float>(x), static_cast<float>(z), heights_[index]);
                 vertices_[index].uv = {static_cast<float>(x) / (kTerrainSize - 1), static_cast<float>(z) / (kTerrainSize - 1)};
-                vertices_[index].hydro = {water_[index], sediment_[index]};
+                vertices_[index].hydro = {displayWater_[index], displaySediment_[index]};
             }
         }
         for (int z = 0; z < kTerrainSize; ++z) {
@@ -588,80 +647,15 @@ private:
         indices_.insert(indices_.end(), {base, base + 2, base + 1, base + 1, base + 2, base + 3});
     }
 
-    glm::vec2 steepestNeighbor(float x, float z, float currentHeight) const
-    {
-        glm::vec2 best(0.0f);
-        float bestHeight = currentHeight;
-        for (int dz = -1; dz <= 1; ++dz) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dz == 0) continue;
-                float nx = glm::clamp(x + static_cast<float>(dx), 1.0f, static_cast<float>(kTerrainSize - 2));
-                float nz = glm::clamp(z + static_cast<float>(dz), 1.0f, static_cast<float>(kTerrainSize - 2));
-                float h = sampleHeight(nx, nz);
-                if (h < bestHeight) {
-                    bestHeight = h;
-                    best = glm::vec2(nx - x, nz - z);
-                }
-            }
-        }
-        float len = glm::length(best);
-        return len > 0.001f ? best / len : glm::vec2(0.0f);
-    }
-
-    void rebuildFlowPaths()
-    {
-        flowPaths_.clear();
-        std::mt19937 rng(static_cast<std::uint32_t>(settings_.seed * 747796405u + 2891336453u));
-        std::uniform_real_distribution<float> dist(4.0f, static_cast<float>(kTerrainSize - 5));
-        std::uniform_real_distribution<float> phase(0.0f, 1.0f);
-
-        for (int attempt = 0; attempt < 1200 && flowPaths_.size() < 160; ++attempt) {
-            float x = dist(rng);
-            float z = dist(rng);
-            float startHeight = sampleHeight(x, z);
-            if (startHeight < settings_.heightScale * 0.28f) continue;
-
-            FlowPath path;
-            path.phase = phase(rng);
-            glm::vec2 dir(0.0f);
-            float lastHeight = startHeight;
-            for (int step = 0; step < 72; ++step) {
-                HeightSample sample = sampleHeightAndGradient(x, z);
-                path.points.push_back(terrainPoint(x, z));
-                glm::vec2 downhill = -sample.gradient;
-                if (glm::length(downhill) < 0.0015f) downhill = steepestNeighbor(x, z, sample.height);
-                if (glm::length(downhill) < 0.001f) break;
-                dir = dir * 0.45f + glm::normalize(downhill) * 0.55f;
-                dir = glm::normalize(dir);
-                float nextX = x + dir.x * 1.28f;
-                float nextZ = z + dir.y * 1.28f;
-                if (nextX < 1.0f || nextX >= kTerrainSize - 2 || nextZ < 1.0f || nextZ >= kTerrainSize - 2) break;
-                float nextHeight = sampleHeight(nextX, nextZ);
-                if (nextHeight > sample.height - settings_.heightScale * 0.0007f) {
-                    glm::vec2 fallback = steepestNeighbor(x, z, sample.height);
-                    if (glm::length(fallback) < 0.001f) break;
-                    nextX = x + fallback.x;
-                    nextZ = z + fallback.y;
-                    nextHeight = sampleHeight(nextX, nextZ);
-                }
-                x = nextX;
-                z = nextZ;
-                lastHeight = nextHeight;
-                if (lastHeight < settings_.heightScale * 0.045f) break;
-            }
-
-            float drop = startHeight - lastHeight;
-            if (path.points.size() >= 15 && drop > settings_.heightScale * 0.08f) flowPaths_.push_back(std::move(path));
-        }
-    }
-
     TerrainSettings settings_{};
     std::vector<float> heights_;
     std::vector<float> water_;
     std::vector<float> sediment_;
-    std::vector<FlowPath> flowPaths_;
+    std::vector<float> displayWater_;
+    std::vector<float> displaySediment_;
+    std::vector<Droplet> liveDroplets_;
+    std::vector<glm::vec3> particlePositions_;
     bool hasErosionFlow_ = false;
-    int erosionPass_ = 0;
     std::mt19937 erosionRng_{static_cast<std::uint32_t>(settings_.seed)};
     std::vector<Vertex> vertices_;
     std::vector<std::uint32_t> indices_;
@@ -752,10 +746,8 @@ private:
     bool terrainDirty_ = true;
     bool wireframe_ = false;
     bool showFlowParticles_ = true;
-    float flowParticleSpeed_ = 0.34f;
     bool erosionAnimating_ = false;
-    int erosionRemainingDrops_ = 0;
-    int erosionBatchDrops_ = 360;
+    float erosionSpeed_ = 0.35f;
     bool framebufferResized_ = false;
 
     void initWindow()
@@ -1737,14 +1729,11 @@ private:
     void updateErosionAnimation()
     {
         if (!erosionAnimating_) return;
-        int batch = std::min(erosionBatchDrops_, erosionRemainingDrops_);
-        bool finish = batch >= erosionRemainingDrops_;
-        terrain_.erodeAnimatedStep(batch, finish);
-        erosionRemainingDrops_ -= batch;
+        terrain_.stepLiveDroplets(erosionSpeed_);
         terrainDirty_ = true;
-        if (finish || erosionRemainingDrops_ <= 0) {
-            erosionRemainingDrops_ = 0;
+        if (!terrain_.hasActiveDroplets()) {
             erosionAnimating_ = false;
+            terrain_.finishLiveErosion();
         }
     }
 
@@ -1772,42 +1761,24 @@ private:
         ImGui::End();
 
         ImGui::SetNextWindowPos(ImVec2(18, 318), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(330, 242), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(330, 292), ImGuiCond_FirstUseEver);
         ImGui::Begin("Erosion");
         ImGui::SliderInt("Drops", &terrain_.settings().erosionDrops, 1000, 45000);
         ImGui::SliderFloat("Radius", &terrain_.settings().erosionRadius, 1.0f, 5.0f, "%.1f");
         ImGui::SliderFloat("Inertia", &terrain_.settings().inertia, 0.0f, 0.92f, "%.2f");
         ImGui::SliderFloat("Capacity", &terrain_.settings().capacity, 1.0f, 10.0f, "%.1f");
         ImGui::SliderFloat("Evaporation", &terrain_.settings().evaporation, 0.005f, 0.12f, "%.3f");
-        ImGui::Checkbox("Flow particles", &showFlowParticles_);
-        ImGui::SliderFloat("Particle speed", &flowParticleSpeed_, 0.05f, 1.20f, "%.2f");
-        ImGui::SliderInt("Animation batch", &erosionBatchDrops_, 60, 1600);
-        if (ImGui::Button("Run erosion")) {
-            erosionAnimating_ = false;
-            terrain_.erode(terrain_.settings().erosionDrops);
-            terrainDirty_ = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Quick pass")) {
-            erosionAnimating_ = false;
-            terrain_.erode(2500);
-            terrainDirty_ = true;
-        }
-        if (erosionAnimating_) {
-            ImGui::SameLine();
-            if (ImGui::Button("Stop animation")) erosionAnimating_ = false;
-            ImGui::ProgressBar(1.0f - static_cast<float>(erosionRemainingDrops_) / std::max(1.0f, static_cast<float>(terrain_.settings().erosionDrops)), ImVec2(-1.0f, 0.0f));
-        } else if (ImGui::Button("Animate erosion")) {
-            erosionRemainingDrops_ = terrain_.settings().erosionDrops;
-            terrain_.beginAnimatedErosion(erosionRemainingDrops_);
+        ImGui::Checkbox("Show particles", &showFlowParticles_);
+        ImGui::SliderFloat("Simulation speed", &erosionSpeed_, 0.06f, 1.0f, "%.2f");
+        if (erosionAnimating_) ImGui::BeginDisabled();
+        if (ImGui::Button(erosionAnimating_ ? "Simulating" : "Start simulation")) {
+            int drops = terrain_.settings().erosionDrops;
+            terrain_.beginLiveErosion(drops);
+            terrain_.spawnLiveDroplets(drops, drops);
             erosionAnimating_ = true;
             terrainDirty_ = true;
         }
-        if (ImGui::Button("Soften peaks")) {
-            erosionAnimating_ = false;
-            terrain_.smoothPeaks();
-            terrainDirty_ = true;
-        }
+        if (erosionAnimating_) ImGui::EndDisabled();
         ImGui::End();
 
         ImGui::SetNextWindowPos(ImVec2(365, 18), ImGuiCond_FirstUseEver);
@@ -1858,48 +1829,17 @@ private:
     void drawFlowOverlay()
     {
         if (!showFlowParticles_) return;
-        if (!terrain_.hasErosionFlow()) return;
-        const auto& paths = terrain_.flowPaths();
-        if (paths.empty()) return;
+        const auto& particles = terrain_.particlePositions();
+        if (particles.empty()) return;
         float aspect = static_cast<float>(std::max(1u, swapchainExtent_.width)) / static_cast<float>(std::max(1u, swapchainExtent_.height));
         glm::mat4 proj = glm::perspective(glm::radians(58.0f), aspect, 0.1f, 650.0f);
         proj[1][1] *= -1.0f;
         glm::mat4 viewProj = proj * camera_.view();
         ImDrawList* drawList = ImGui::GetForegroundDrawList();
-        double time = ImGui::GetTime();
-
-        for (const Terrain::FlowPath& path : paths) {
-            if (path.points.size() < 2) continue;
-            ImVec2 previous{};
-            glm::vec3 previousWorld{};
-            bool hasPrevious = false;
-            for (std::size_t i = 0; i < path.points.size(); i += 8) {
-                ImVec2 current{};
-                if (projectToScreen(path.points[i], viewProj, current)) {
-                    if (hasPrevious) {
-                        glm::vec3 midpoint = glm::mix(previousWorld, path.points[i], 0.5f);
-                        if (!terrain_.occludesSegment(camera_.position, midpoint)) drawList->AddLine(previous, current, IM_COL32(71, 156, 187, 16), 0.7f);
-                    }
-                    previous = current;
-                    previousWorld = path.points[i];
-                    hasPrevious = true;
-                } else {
-                    hasPrevious = false;
-                }
-            }
-
-            for (int dot = 0; dot < 5; ++dot) {
-                float phase = std::fmod(static_cast<float>(time) * flowParticleSpeed_ + path.phase + static_cast<float>(dot) * 0.19f, 1.0f);
-                float cursor = phase * static_cast<float>(path.points.size() - 1);
-                std::size_t index = std::min(static_cast<std::size_t>(cursor), path.points.size() - 2);
-                float local = cursor - static_cast<float>(index);
-                glm::vec3 world = glm::mix(path.points[index], path.points[index + 1], local);
-                ImVec2 screen{};
-                if (projectToScreen(world, viewProj, screen)) {
-                    float pulse = 0.65f + 0.35f * std::sin(phase * 6.28318f);
-                    drawList->AddCircleFilled(screen, 2.4f + pulse * 1.1f, IM_COL32(111, 226, 242, 168));
-                    drawList->AddCircle(screen, 4.3f + pulse * 1.0f, IM_COL32(192, 249, 255, 62), 10, 1.0f);
-                }
+        for (const glm::vec3& world : particles) {
+            ImVec2 screen{};
+            if (projectToScreen(world, viewProj, screen)) {
+                drawList->AddRectFilled(ImVec2(screen.x - 1.05f, screen.y - 1.05f), ImVec2(screen.x + 1.05f, screen.y + 1.05f), IM_COL32(168, 226, 244, 172));
             }
         }
     }

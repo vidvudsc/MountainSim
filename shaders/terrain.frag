@@ -85,7 +85,7 @@ void main()
     vec3 cliff = mix(vec3(0.19, 0.205, 0.215), vec3(0.48, 0.50, 0.51), scratch * 0.72 + fine * 0.28);
     vec3 snow = mix(vec3(0.78, 0.88, 0.94), vec3(1.0, 0.99, 0.92), detail);
     snow = mix(snow, vec3(0.62, 0.67, 0.69), smoothstep(0.58, 0.88, slope) * 0.24);
-    vec3 sediment = mix(vec3(0.37, 0.28, 0.16), vec3(0.64, 0.48, 0.30), medium);
+    vec3 sediment = mix(vec3(0.42, 0.36, 0.27), vec3(0.70, 0.64, 0.51), medium);
 
     float rockMask = smoothstep(0.24, 0.58, slope);
     float cliffMask = smoothstep(0.48, 0.82, slope);
@@ -115,15 +115,16 @@ void main()
     if (cutFace > 0.5) {
         base = cutMaterial;
     } else {
-        base = mix(base, sediment, clamp(vHydro.y * sedimentTint * showSediment, 0.0, 0.55));
+        base = mix(base, sediment, clamp(vHydro.y * sedimentTint * showSediment, 0.0, 0.46));
         base *= 0.86 + fine * 0.22 + broad * 0.10;
 
-        float routeWater = smoothstep(0.10, 0.88, vHydro.x) * waterTint;
-        float pocketWater = smoothstep(waterLevel - 0.008, waterLevel + 0.004, waterLevel - height01)
-                          * smoothstep(0.34, 0.76, vHydro.x) * 0.34;
+        float routeWater = smoothstep(0.22, 0.92, vHydro.x) * waterTint;
+        float pocketWater = smoothstep(waterLevel - 0.006, waterLevel + 0.003, waterLevel - height01)
+                          * smoothstep(0.48, 0.82, vHydro.x) * 0.18;
         wet = clamp((routeWater + pocketWater) * showWater, 0.0, 1.0);
-        vec3 waterColor = mix(vec3(0.035, 0.11, 0.14), vec3(0.12, 0.28, 0.31), broad);
-        base = mix(base, waterColor, wet * 0.78);
+        vec3 washColor = mix(vec3(0.58, 0.62, 0.60), vec3(0.72, 0.76, 0.73), broad);
+        vec3 channelColor = mix(washColor, vec3(0.44, 0.55, 0.57), smoothstep(0.78, 1.0, vHydro.x));
+        base = mix(base, channelColor, wet * 0.54);
     }
 
     float diff = max(dot(n, lightDir), 0.0);
