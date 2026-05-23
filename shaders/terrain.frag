@@ -60,6 +60,8 @@ void main()
     float sedimentTint = u.effects.y;
     float showWater = u.effects.z;
     float showSediment = u.effects.w;
+    float cutFace = vHydro.x < -0.5 ? 1.0 : 0.0;
+    float bottomFace = vHydro.x < -1.5 ? 1.0 : 0.0;
 
     vec3 n = normalize(vNormal);
     vec3 lightDir = normalize(u.sunDir.xyz);
@@ -95,12 +97,34 @@ void main()
     base = mix(base, rock, rockMask);
     base = mix(base, cliff, cliffMask);
     base = mix(base, snow, snowMask);
-    base = mix(base, sediment, clamp(vHydro.y * sedimentTint * showSediment, 0.0, 0.55));
-    base *= 0.86 + fine * 0.22 + broad * 0.10;
 
-    float wet = clamp((vHydro.x * waterTint + smoothstep(waterLevel - 0.012, waterLevel + 0.006, waterLevel - height01)) * showWater, 0.0, 1.0);
-    vec3 waterColor = mix(vec3(0.035, 0.11, 0.14), vec3(0.12, 0.28, 0.31), broad);
-    base = mix(base, waterColor, wet * 0.78);
+    float stratum = smoothstep(0.42, 0.58, noise(vec2(vWorldPos.y * 1.15, vUv.x * 8.0 + vUv.y * 5.0)));
+    float layer = smoothstep(0.47, 0.53, sin(vWorldPos.y * 1.7 + broad * 2.8) * 0.5 + 0.5);
+    float cutDepth = clamp((vWorldPos.y + 5.0) / (heightScale + 8.0), 0.0, 1.0);
+    vec3 compactEarth = vec3(0.20, 0.18, 0.15);
+    vec3 weatheredStone = vec3(0.42, 0.39, 0.31);
+    vec3 paleLayer = vec3(0.58, 0.53, 0.40);
+    vec3 darkLayer = vec3(0.13, 0.14, 0.13);
+    vec3 cutMaterial = mix(compactEarth, weatheredStone, cutDepth);
+    cutMaterial = mix(cutMaterial, paleLayer, layer * 0.28);
+    cutMaterial = mix(cutMaterial, darkLayer, (1.0 - cutDepth) * 0.22 + stratum * 0.12);
+    cutMaterial *= 0.86 + fine * 0.12;
+    cutMaterial = mix(cutMaterial, vec3(0.08, 0.085, 0.08), bottomFace);
+
+    float wet = 0.0;
+    if (cutFace > 0.5) {
+        base = cutMaterial;
+    } else {
+        base = mix(base, sediment, clamp(vHydro.y * sedimentTint * showSediment, 0.0, 0.55));
+        base *= 0.86 + fine * 0.22 + broad * 0.10;
+
+        float routeWater = smoothstep(0.10, 0.88, vHydro.x) * waterTint;
+        float pocketWater = smoothstep(waterLevel - 0.008, waterLevel + 0.004, waterLevel - height01)
+                          * smoothstep(0.34, 0.76, vHydro.x) * 0.34;
+        wet = clamp((routeWater + pocketWater) * showWater, 0.0, 1.0);
+        vec3 waterColor = mix(vec3(0.035, 0.11, 0.14), vec3(0.12, 0.28, 0.31), broad);
+        base = mix(base, waterColor, wet * 0.78);
+    }
 
     float diff = max(dot(n, lightDir), 0.0);
     float rim = pow(max(1.0 - dot(n, viewDir), 0.0), 2.2);
