@@ -1,17 +1,17 @@
-#version 410 core
+#version 450
 
-layout (location = 0) in vec3 aPosition;
+layout(location = 0) out vec2 vUv;
 
-uniform mat4 uView;
-uniform mat4 uProjection;
-
-out vec3 vDirection;
+vec2 positions[3] = vec2[](
+    vec2(-1.0, -1.0),
+    vec2( 3.0, -1.0),
+    vec2(-1.0,  3.0)
+);
 
 void main()
 {
-    vDirection = aPosition;
-    mat4 viewNoTranslation = mat4(mat3(uView));
-    vec4 pos = uProjection * viewNoTranslation * vec4(aPosition, 1.0);
-    gl_Position = pos.xyww;
+    vec2 p = positions[gl_VertexIndex];
+    vUv = p * 0.5 + 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
 }
 

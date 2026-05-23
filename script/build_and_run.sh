@@ -8,6 +8,8 @@ MODE="${1:-run}"
 
 cd "$ROOT_DIR"
 
+export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json}"
+
 pkill -x "$APP_NAME" 2>/dev/null || true
 
 cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=RelWithDebInfo

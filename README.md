@@ -1,31 +1,21 @@
 # Mountains
 
-Native C++ terrain lab inspired by the referenced terrain-generation video. The current renderer is OpenGL while a Vulkan/MoltenVK port is being staged.
+Native C++ terrain lab inspired by the referenced terrain-generation video, rendered with Vulkan through MoltenVK on macOS.
 
 ## Stack
 
 - C++20
-- OpenGL 4.1 core profile, which is the highest profile macOS exposes
+- Vulkan / MoltenVK renderer
 - GLFW for the window and input
-- GLEW for OpenGL loading
 - GLM for vector and matrix math
 - Dear ImGui for the tweakable control panel
 - CMake for builds
-- Vulkan/MoltenVK probe target for validating the next renderer path on macOS
 
 ## Run
 
 ```bash
 ./script/build_and_run.sh
 ```
-
-## Vulkan Probe
-
-```bash
-./script/vulkan_probe.sh
-```
-
-This validates the MoltenVK path by creating a Vulkan instance and GLFW window surface and listing the available physical device.
 
 ## Controls
 
