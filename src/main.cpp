@@ -29,7 +29,7 @@
 
 namespace {
 
-constexpr int kTerrainSize = 161;
+constexpr int kTerrainSize = 193;
 constexpr float kTerrainWorldSize = 165.0f;
 constexpr int kMaxFramesInFlight = 2;
 
@@ -56,8 +56,8 @@ struct TerrainSettings {
     int octaves = 6;
     float frequency = 1.72f;
     float lacunarity = 2.02f;
-    float gain = 0.46f;
-    float ridgeMix = 0.46f;
+    float persistence = 0.48f;
+    float peakSharpness = 1.45f;
     float heightScale = 42.0f;
     float snowLevel = 0.67f;
     float waterLevel = 0.10f;
@@ -69,7 +69,7 @@ struct TerrainSettings {
     bool showWater = true;
     bool showSediment = true;
     int erosionDrops = 18000;
-    float erosionRadius = 2.4f;
+    float erosionRadius = 1.9f;
     float inertia = 0.18f;
     float capacity = 3.6f;
     float minCapacity = 0.02f;
@@ -186,24 +186,29 @@ public:
             for (int x = 0; x < kTerrainSize; ++x) {
                 glm::vec2 uv(static_cast<float>(x) / (kTerrainSize - 1), static_cast<float>(z) / (kTerrainSize - 1));
                 glm::vec2 centered = uv * 2.0f - 1.0f;
-                float px = centered.x * settings.frequency;
-                float py = centered.y * settings.frequency;
-                float amp = 1.0f;
-                float freq = 1.0f;
-                float sum = 0.0f;
-                float norm = 0.0f;
-                for (int o = 0; o < settings.octaves; ++o) {
-                    float n = perlin.noise(px * freq, py * freq);
-                    sum += n * amp;
-                    norm += amp;
-                    amp *= settings.gain;
-                    freq *= settings.lacunarity;
-                }
-                float fbm = sum / std::max(norm, 0.001f) * 0.5f + 0.5f;
-                float largeForms = perlin.noise(centered.x * 0.72f + 11.4f, centered.y * 0.72f - 3.1f) * 0.5f + 0.5f;
-                float continent = smoothstep01(1.10f - glm::length(centered) * 0.46f);
-                float mountainMask = smoothstep01((largeForms - 0.18f) / 0.74f);
-                float h = glm::mix(fbm * 0.42f, std::pow(fbm, 1.22f), mountainMask) * continent;
+                auto fbm = [&](glm::vec2 q, int octaves, float baseFrequency, float persistence) {
+                    float amp = 1.0f;
+                    float freq = baseFrequency;
+                    float sum = 0.0f;
+                    float norm = 0.0f;
+                    for (int o = 0; o < octaves; ++o) {
+                        sum += perlin.noise(q.x * freq, q.y * freq) * amp;
+                        norm += amp;
+                        amp *= persistence;
+                        freq *= settings.lacunarity;
+                    }
+                    return sum / std::max(norm, 0.001f) * 0.5f + 0.5f;
+                };
+
+                float base = fbm(centered + glm::vec2(4.2f, -8.7f), settings.octaves, settings.frequency, settings.persistence);
+                float detail = fbm(centered + glm::vec2(-11.4f, 5.9f), std::max(3, settings.octaves - 2), settings.frequency * 3.4f, settings.persistence * 0.82f);
+                float micro = fbm(centered + glm::vec2(19.1f, 13.3f), 3, settings.frequency * 11.0f, settings.persistence * 0.55f);
+                float massif = fbm(centered + glm::vec2(31.0f, -17.0f), 3, 0.78f, 0.58f);
+                float islandMask = smoothstep01(1.13f - glm::length(centered * glm::vec2(0.92f, 1.05f)) * 0.52f);
+                float mountainMask = smoothstep01((massif - 0.30f) / 0.48f);
+                float h = base * 0.72f + detail * 0.22f + micro * 0.06f;
+                h = std::pow(glm::clamp(h, 0.0f, 1.0f), settings.peakSharpness);
+                h *= glm::mix(0.42f, 1.18f, mountainMask) * islandMask;
                 heights_[idx(x, z)] = h;
                 minHeight = std::min(minHeight, h);
                 maxHeight = std::max(maxHeight, h);
@@ -211,9 +216,9 @@ public:
         }
         for (float& h : heights_) {
             h = (h - minHeight) / std::max(maxHeight - minHeight, 0.001f);
-            h = std::pow(h, 1.32f) * settings.heightScale;
+            h = h * settings.heightScale;
         }
-        smoothHeightmap(2, 0.18f);
+        smoothHeightmap(1, 0.08f);
         rebuildVertices();
     }
 
@@ -292,7 +297,7 @@ public:
     void finishErosionPass()
     {
         updateHydroDisplay();
-        smoothHeightmap(2, 0.075f);
+        smoothHeightmap(1, 0.028f);
         rebuildVertices();
         hasErosionFlow_ = true;
     }
@@ -1748,8 +1753,8 @@ private:
         regenerate |= ImGui::SliderInt("Octaves", &editable.octaves, 1, 10);
         regenerate |= ImGui::SliderFloat("Noise frequency", &editable.frequency, 0.5f, 7.0f, "%.2f");
         regenerate |= ImGui::SliderFloat("Lacunarity", &editable.lacunarity, 1.4f, 3.2f, "%.2f");
-        regenerate |= ImGui::SliderFloat("Gain", &editable.gain, 0.25f, 0.72f, "%.2f");
-        regenerate |= ImGui::SliderFloat("Ridge mix", &editable.ridgeMix, 0.0f, 1.0f, "%.2f");
+        regenerate |= ImGui::SliderFloat("Persistence", &editable.persistence, 0.25f, 0.72f, "%.2f");
+        regenerate |= ImGui::SliderFloat("Peak sharpness", &editable.peakSharpness, 0.80f, 2.60f, "%.2f");
         regenerate |= ImGui::SliderFloat("Height scale", &editable.heightScale, 12.0f, 78.0f, "%.1f");
         if (regenerate || ImGui::Button("Regenerate heightmap")) {
             erosionAnimating_ = false;
