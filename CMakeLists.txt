@@ -82,6 +82,12 @@ target_include_directories(Mountains PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
 )
 
+# The CPU weather solver is the heaviest compute in the app; let the compiler use the
+# full M-series instruction set and aggressive optimization for the vectorizable
+# advection/microphysics/thermo loops. (No -ffast-math: the solver relies on finite-math
+# clamps and must stay well-defined during transient spikes.)
+target_compile_options(Mountains PRIVATE -O3 -mcpu=apple-m1)
+
 target_link_libraries(Mountains PRIVATE
   glfw
   Vulkan::Vulkan

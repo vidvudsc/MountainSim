@@ -82,8 +82,12 @@ public:
         theta_.assign(n, 0.0f); qv_.assign(n, 0.0f); qc_.assign(n, 0.0f); qr_.assign(n, 0.0f);
         u2_.assign(n, 0.0f); v2_.assign(n, 0.0f); w2_.assign(n, 0.0f);
         s2_.assign(n, 0.0f);
-        p_.assign(n, 0.0f); div_.assign(n, 0.0f);
+        // p_ carries one extra "zero" slot at index n: the precomputed Poisson stencil
+        // points excluded (solid/boundary) neighbours at it so the SOR sweep can gather
+        // all six neighbours branchlessly.
+        p_.assign(n + 1, 0.0f); div_.assign(n, 0.0f);
         solid_.assign(n, 0u);
+        poissonDirty_ = true;
         colHeight_.assign(static_cast<std::size_t>(nx_) * nz_, baseY_);
         surfaceJ_.assign(static_cast<std::size_t>(nx_) * nz_, 0);
         precipRate_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
@@ -256,6 +260,15 @@ private:
     std::vector<float> u_, v_, w_, theta_, qv_, qc_, qr_;
     std::vector<float> u2_, v2_, w2_, s2_, p_, div_;
     std::vector<std::uint8_t> solid_;
+
+    // Precomputed Poisson stencil for the pressure solve. The linear system only changes
+    // when the terrain (solid mask) changes, so the per-cell neighbour indices, inverse
+    // diagonal, and red/black colour lists are built once and reused across every SOR
+    // sweep of every step instead of being recomputed ~48x/step.
+    std::vector<int> nbXm_, nbXp_, nbYm_, nbYp_, nbZm_, nbZp_;
+    std::vector<float> invDen_;
+    std::vector<int> redCells_, blackCells_;
+    bool poissonDirty_ = true;
     std::vector<float> colHeight_;
     std::vector<int> surfaceJ_;
     std::vector<float> precipRate_, precipAccum_;
@@ -480,6 +493,43 @@ private:
                 }
                 surfaceJ_[static_cast<std::size_t>(k) * nx_ + i] = surf;
             }
+        poissonDirty_ = true; // solid mask changed -> Poisson stencil must be rebuilt
+    }
+
+    // Build the per-cell Poisson stencil + red/black colour lists from the current solid
+    // mask. Excluded neighbours (out of bounds or solid, i.e. Neumann walls) point at the
+    // zero sentinel slot p_[cellCount()] so the sweep can gather all six branchlessly.
+    void buildPoisson()
+    {
+        const int N = static_cast<int>(cellCount());
+        const int Z = N; // sentinel zero slot in p_
+        const float cx = 1.0f / (dx_ * dx_);
+        const float cy = 1.0f / (dy_ * dy_);
+        const float cz = 1.0f / (dz_ * dz_);
+        nbXm_.assign(N, Z); nbXp_.assign(N, Z);
+        nbYm_.assign(N, Z); nbYp_.assign(N, Z);
+        nbZm_.assign(N, Z); nbZp_.assign(N, Z);
+        invDen_.assign(N, 0.0f);
+        redCells_.clear(); blackCells_.clear();
+        for (int c = 0; c < N; ++c) {
+            if (solid_[c]) continue;
+            int i = c % nx_, j = (c / nx_) % ny_, k = c / (nx_ * ny_);
+            float den = 0.0f;
+            auto set = [&](bool inb, int nb, float coef, int& slot) {
+                if (inb && !solid_[nb]) { slot = nb; den += coef; }
+            };
+            set(i + 1 < nx_, idx(i + 1, j, k), cx, nbXp_[c]);
+            set(i - 1 >= 0, idx(i - 1, j, k), cx, nbXm_[c]);
+            set(j + 1 < ny_, idx(i, j + 1, k), cy, nbYp_[c]);
+            set(j - 1 >= 0, idx(i, j - 1, k), cy, nbYm_[c]);
+            set(k + 1 < nz_, idx(i, j, k + 1), cz, nbZp_[c]);
+            set(k - 1 >= 0, idx(i, j, k - 1), cz, nbZm_[c]);
+            if (den <= 0.0f) continue; // isolated cell: pressure stays 0
+            invDen_[c] = 1.0f / den;
+            if ((i + j + k) & 1) blackCells_.push_back(c);
+            else redCells_.push_back(c);
+        }
+        poissonDirty_ = false;
     }
 
     // --- field sampling for advection (trilinear, clamped) ---
@@ -591,6 +641,11 @@ private:
             int j = (c / nx_) % ny_;
             float th0 = thetaEnv(j, p);
             float qv0 = qvEnvLevel(j, p);
+            // Bound the potential-temperature anomaly. Real convective plumes stay within a
+            // few K of the environment; a wider band here is only a safety rail that stops an
+            // explicit latent-heating overshoot (possible after an unusually large substep)
+            // from running theta away and seeding NaNs through the buoyancy/thermo chain.
+            theta_[c] = glm::clamp(theta_[c], th0 - 30.0f, th0 + 30.0f);
             float buoy = kG * ((theta_[c] - th0) / th0 + 0.61f * (qv_[c] - qv0) - qc_[c] - qr_[c]);
             v_[c] += p.buoyancy * buoy * dt;
             // sponge near lid to damp vertical reflections (damping fraction clamped to [0,1]
@@ -656,6 +711,27 @@ private:
 
         // 9. Outflow.
         zeroGradientOutflow(p);
+
+        // 10. Finalize: the pressure correction (step 7) and diffusion (step 8) write the
+        // velocities that get published without any further clamp, so guarantee here that
+        // every field handed to the renderer is finite and physically bounded. A blowup can
+        // then at worst be a damped local transient -- never an all-NaN frame.
+        parallelFor(static_cast<int>(cellCount()), [&](int c) {
+            if (solid_[c]) return;
+            auto scrub = [](float& x, float lo, float hi, float fallback) {
+                if (!std::isfinite(x)) x = fallback;
+                else x = glm::clamp(x, lo, hi);
+            };
+            int j = (c / nx_) % ny_;
+            float th0 = thetaEnv(j, p);
+            scrub(u_[c], -45.0f, 45.0f, 0.0f);
+            scrub(v_[c], -45.0f, 45.0f, 0.0f);
+            scrub(w_[c], -45.0f, 45.0f, 0.0f);
+            scrub(theta_[c], th0 - 30.0f, th0 + 30.0f, th0);
+            scrub(qv_[c], 0.0f, 0.05f, 0.0f);
+            scrub(qc_[c], 0.0f, 0.05f, 0.0f);
+            scrub(qr_[c], 0.0f, 0.05f, 0.0f);
+        });
     }
 
     void diffuse(std::vector<float>& f, float alpha)
@@ -815,30 +891,30 @@ private:
         // Red-black Gauss-Seidel with SOR. Updating one colour at a time is race-free under
         // parallelism (every neighbour is the opposite colour) and the over-relaxation factor
         // makes it converge several times faster than Jacobi, so high-resolution grids still
-        // reach a near-divergence-free state within the same iteration budget.
+        // reach a near-divergence-free state within the same iteration budget. The stencil
+        // (neighbour indices + inverse diagonal + colour lists) is precomputed per terrain
+        // change, so each sweep is a pure gather over only the cells of one colour.
+        if (poissonDirty_) buildPoisson();
         const float omega = 1.7f;
         std::fill(p_.begin(), p_.end(), 0.0f);
+        const int* xm = nbXm_.data(); const int* xp = nbXp_.data();
+        const int* ym = nbYm_.data(); const int* yp = nbYp_.data();
+        const int* zm = nbZm_.data(); const int* zp = nbZp_.data();
+        const float* idn = invDen_.data();
+        const float* dv = div_.data();
+        float* pp = p_.data();
+        auto sweep = [&](const std::vector<int>& cells) {
+            parallelFor(static_cast<int>(cells.size()), [&](int t) {
+                int c = cells[t];
+                float num = cx * (pp[xm[c]] + pp[xp[c]])
+                          + cy * (pp[ym[c]] + pp[yp[c]])
+                          + cz * (pp[zm[c]] + pp[zp[c]]);
+                pp[c] += omega * ((num - dv[c]) * idn[c] - pp[c]);
+            });
+        };
         for (int it = 0; it < p.pressureIters; ++it) {
-            for (int color = 0; color < 2; ++color) {
-                parallelFor(static_cast<int>(cellCount()), [&](int c) {
-                    if (solid_[c]) { p_[c] = 0.0f; return; }
-                    int i = c % nx_, j = (c / nx_) % ny_, k = c / (nx_ * ny_);
-                    if (((i + j + k) & 1) != color) return;
-                    float num = 0.0f, den = 0.0f;
-                    auto acc = [&](bool ok, int nb, float coef) {
-                        if (ok && !solid_[nb]) { num += coef * p_[nb]; den += coef; }
-                    };
-                    acc(i + 1 < nx_, idx(std::min(i + 1, nx_ - 1), j, k), cx);
-                    acc(i - 1 >= 0, idx(std::max(i - 1, 0), j, k), cx);
-                    acc(j + 1 < ny_, idx(i, std::min(j + 1, ny_ - 1), k), cy);
-                    acc(j - 1 >= 0, idx(i, std::max(j - 1, 0), k), cy);
-                    acc(k + 1 < nz_, idx(i, j, std::min(k + 1, nz_ - 1)), cz);
-                    acc(k - 1 >= 0, idx(i, j, std::max(k - 1, 0)), cz);
-                    if (den <= 0.0f) { p_[c] = 0.0f; return; }
-                    float pnew = (num - div_[c]) / den;
-                    p_[c] += omega * (pnew - p_[c]);
-                });
-            }
+            sweep(redCells_);
+            sweep(blackCells_);
         }
 
         // velocity correction
