@@ -28,7 +28,8 @@
 struct WeatherParams {
     float windSpeed = 7.0f;       // m/s prevailing inflow
     float windDirDeg = 20.0f;     // 0 -> blowing toward +x
-    float inflowRH = 0.75f;       // relative humidity of incoming air
+    float inflowRH = 0.85f;       // relative humidity of incoming air (moist enough that
+                                  // realistic orographic lift reaches saturation over peaks)
     float surfaceTempC = 14.0f;   // base surface temperature
     float thetaLapse = 0.0050f;   // K/m potential-temperature gradient (stability)
     float solarHeating = 0.010f;  // K/s surface heating at full incidence
@@ -42,7 +43,7 @@ struct WeatherParams {
     float buoyancy = 1.0f;        // buoyancy multiplier
     int pressureIters = 24;       // Jacobi pressure iterations
     float timeScale = 45.0f;      // sim seconds per real second
-    float vScale = 14.0f;         // atmosphere-depth scale: physical altitude = renderHeight * vScale
+    float vScale = 18.0f;         // atmosphere-depth scale: physical altitude = renderHeight * vScale
                                   // (box renders at 165 m but the modeled column is deeper so
                                   //  adiabatic cooling on lift is strong enough to form cloud)
 };
@@ -296,9 +297,8 @@ private:
     std::condition_variable poolStartCv_;
     std::mutex poolDoneM_;
     std::condition_variable poolDoneCv_;
-    std::atomic<int> poolNext_{0};               // next chunk index to claim
-    std::atomic<int> poolDone_{0};               // chunks completed
-    int poolCount_ = 0, poolChunk_ = 0, poolParts_ = 0;
+    std::atomic<int> poolDone_{0};               // worker partitions completed this generation
+    int poolCount_ = 0, poolChunk_ = 0;
     std::uint64_t poolGen_ = 0;                   // bumped to release a new dispatch
     bool poolStop_ = false;
     std::function<void(int, int)> poolFn_;        // operates on a [start,end) sub-range
@@ -409,43 +409,29 @@ private:
         if (count < 8192 || poolN_ <= 0) { for (int i = 0; i < count; ++i) fn(i); return; }
 
         auto* self = const_cast<Weather*>(this);
-        // Slice into ~4 chunks per participant so the atomic-ticket scheduler can rebalance
-        // when some rows hit solid cells early and finish faster than others.
-        int parts = (poolN_ + 1) * 4;
-        int chunk = (count + parts - 1) / parts;
-        parts = (count + chunk - 1) / chunk; // trim trailing empty chunks
+        // Fixed-partition fork/join: poolN_ workers + this caller each own exactly one
+        // contiguous partition per generation. A previous design handed chunks out via an
+        // atomic ticket for load balance, but that let a straggler worker bleed into the
+        // next dispatch (it would claim chunks that had been reset for the new generation),
+        // which could call a half-published task -> bad_function_call. The fixed mapping is
+        // race-free: the caller never starts generation N+1 until all workers have finished
+        // generation N (poolDone_ == poolN_), so no worker can ever skip or straddle one.
+        const int parts = poolN_ + 1;
+        const int chunk = (count + parts - 1) / parts;
         {
             std::lock_guard<std::mutex> lk(self->poolM_);
             self->poolFn_ = [&fn](int s, int e) { for (int i = s; i < e; ++i) fn(i); };
             self->poolCount_ = count;
             self->poolChunk_ = chunk;
-            self->poolParts_ = parts;
-            self->poolNext_.store(0, std::memory_order_relaxed);
             self->poolDone_.store(0, std::memory_order_relaxed);
             ++self->poolGen_;
         }
         self->poolStartCv_.notify_all();
-        self->poolDrain();      // caller participates as a worker
-        // Wait until every chunk has been executed.
+        // Caller runs the final partition itself.
+        for (int i = poolN_ * chunk, e = std::min(count, i + chunk); i < e; ++i) fn(i);
+        // Barrier: wait until every worker partition for this generation is done.
         std::unique_lock<std::mutex> lk(self->poolDoneM_);
-        self->poolDoneCv_.wait(lk, [self] { return self->poolDone_.load(std::memory_order_acquire) >= self->poolParts_; });
-        self->poolFn_ = nullptr;
-    }
-
-    // Claim and run chunks until none remain. Shared by the caller and every pool thread.
-    void poolDrain()
-    {
-        for (;;) {
-            int part = poolNext_.fetch_add(1, std::memory_order_relaxed);
-            if (part >= poolParts_) break;
-            int s = part * poolChunk_;
-            int e = std::min(poolCount_, s + poolChunk_);
-            if (s < e) poolFn_(s, e);
-            if (poolDone_.fetch_add(1, std::memory_order_acq_rel) + 1 >= poolParts_) {
-                std::lock_guard<std::mutex> lk(poolDoneM_);
-                poolDoneCv_.notify_one();
-            }
-        }
+        self->poolDoneCv_.wait(lk, [self] { return self->poolDone_.load(std::memory_order_acquire) >= self->poolN_; });
     }
 
     void startPool()
@@ -456,15 +442,21 @@ private:
         if (poolN_ < 1) { poolN_ = 0; return; }
         poolStop_ = false;
         for (int t = 0; t < poolN_; ++t) {
-            poolThreads_.emplace_back([this] {
+            poolThreads_.emplace_back([this, t] {
                 std::uint64_t seen = 0;
                 for (;;) {
-                    std::unique_lock<std::mutex> lk(poolM_);
-                    poolStartCv_.wait(lk, [this, &seen] { return poolStop_ || poolGen_ != seen; });
-                    if (poolStop_) return;
-                    seen = poolGen_;
-                    lk.unlock();
-                    poolDrain();
+                    {
+                        std::unique_lock<std::mutex> lk(poolM_);
+                        poolStartCv_.wait(lk, [this, &seen] { return poolStop_ || poolGen_ != seen; });
+                        if (poolStop_) return;
+                        seen = poolGen_;
+                    }
+                    int s = t * poolChunk_, e = std::min(poolCount_, s + poolChunk_);
+                    if (s < e) poolFn_(s, e);
+                    if (poolDone_.fetch_add(1, std::memory_order_acq_rel) + 1 >= poolN_) {
+                        std::lock_guard<std::mutex> lk(poolDoneM_);
+                        poolDoneCv_.notify_one();
+                    }
                 }
             });
         }
@@ -600,11 +592,18 @@ private:
                 qc_[c] = 0.0f; qr_[c] = 0.0f;
             }
         };
-        int xi = xIn0 ? 0 : nx_ - 1;
-        int zk = zIn0 ? 0 : nz_ - 1;
-        if (std::abs(wind.x) >= std::abs(wind.z)) {
+        // Open BOTH upwind lateral faces. Previously only the dominant-wind axis got an
+        // inflow face and the cross-stream faces stayed rigid walls; the wind's cross
+        // component then piled up against that wall, forcing spurious lift that condensed a
+        // fake stationary cloud band along the box edge (and a clean cross-mountain wind made
+        // no cloud at all). Feeding the moist airmass in on every upwind face lets it flow
+        // straight through, so condensation is driven by terrain lift instead of the walls.
+        if (std::abs(wind.x) > 1e-3f) {
+            int xi = xIn0 ? 0 : nx_ - 1;
             for (int k = 0; k < nz_; ++k) setInflowCol(xi, k);
-        } else {
+        }
+        if (std::abs(wind.z) > 1e-3f) {
+            int zk = zIn0 ? 0 : nz_ - 1;
             for (int i = 0; i < nx_; ++i) setInflowCol(i, zk);
         }
     }
@@ -620,11 +619,13 @@ private:
                 theta_[d] = theta_[s]; qv_[d] = qv_[s]; qc_[d] = qc_[s]; qr_[d] = qr_[s];
             }
         };
-        if (std::abs(wind.x) >= std::abs(wind.z)) {
+        // Open both downwind faces to match the two-axis inflow above.
+        if (std::abs(wind.x) > 1e-3f) {
             int o = (wind.x >= 0.0f) ? nx_ - 1 : 0;
             int s = (wind.x >= 0.0f) ? nx_ - 2 : 1;
             for (int k = 0; k < nz_; ++k) copyCol(o, k, s, k);
-        } else {
+        }
+        if (std::abs(wind.z) > 1e-3f) {
             int o = (wind.z >= 0.0f) ? nz_ - 1 : 0;
             int s = (wind.z >= 0.0f) ? nz_ - 2 : 1;
             for (int i = 0; i < nx_; ++i) copyCol(i, o, i, s);
