@@ -211,6 +211,66 @@ public:
     TerrainSettings& settings() { return settings_; }
     const TerrainSettings& settings() const { return settings_; }
 
+    float surfaceHeightAtWorld(float worldX, float worldZ) const
+    {
+        float x = (worldX / kTerrainWorldSize + 0.5f) * static_cast<float>(kTerrainSize - 1);
+        float z = (worldZ / kTerrainWorldSize + 0.5f) * static_cast<float>(kTerrainSize - 1);
+        x = glm::clamp(x, 0.0f, static_cast<float>(kTerrainSize - 1));
+        z = glm::clamp(z, 0.0f, static_cast<float>(kTerrainSize - 1));
+        return sampleHeight(x, z);
+    }
+
+    float minSurfaceHeight() const
+    {
+        float m = 1e9f;
+        for (float h : heights_) m = std::min(m, h);
+        return (m > 1e8f) ? 0.0f : m;
+    }
+
+    float maxSurfaceHeight() const
+    {
+        float m = -1e9f;
+        for (float h : heights_) m = std::max(m, h);
+        return (m < -1e8f) ? settings_.heightScale : m;
+    }
+
+    // Drive the existing droplet erosion using a precipitation weight grid (column-major,
+    // wnx by wnz over the same world extent). Lets real weather carve the terrain on demand.
+    void erodeWeighted(const std::vector<float>& weights, int wnx, int wnz, int drops)
+    {
+        if (weights.empty() || wnx <= 0 || wnz <= 0 || drops <= 0) return;
+        std::vector<float> cdf(weights.size());
+        float total = 0.0f;
+        for (std::size_t i = 0; i < weights.size(); ++i) {
+            total += std::max(0.0f, weights[i]);
+            cdf[i] = total;
+        }
+        if (total <= 1e-6f) return;
+        beginErosionPass(drops * 7 + 13);
+        std::uniform_real_distribution<float> pick(0.0f, total);
+        std::uniform_real_distribution<float> jitter(-0.5f, 0.5f);
+        for (int d = 0; d < drops; ++d) {
+            float r = pick(erosionRng_);
+            std::size_t lo = 0, hi = cdf.size() - 1;
+            while (lo < hi) {
+                std::size_t mid = (lo + hi) / 2;
+                if (cdf[mid] < r) lo = mid + 1; else hi = mid;
+            }
+            int wi = static_cast<int>(lo % static_cast<std::size_t>(wnx));
+            int wk = static_cast<int>(lo / static_cast<std::size_t>(wnx));
+            float gx = (static_cast<float>(wi) + 0.5f + jitter(erosionRng_)) / static_cast<float>(wnx) * static_cast<float>(kTerrainSize - 1);
+            float gz = (static_cast<float>(wk) + 0.5f + jitter(erosionRng_)) / static_cast<float>(wnz) * static_cast<float>(kTerrainSize - 1);
+            Droplet droplet{};
+            droplet.x = glm::clamp(gx, 1.0f, static_cast<float>(kTerrainSize - 2));
+            droplet.z = glm::clamp(gz, 1.0f, static_cast<float>(kTerrainSize - 2));
+            droplet.speed = 1.0f;
+            droplet.water = 1.0f;
+            droplet.alive = true;
+            while (droplet.alive) advanceDroplet(droplet, 1.0f);
+        }
+        finishErosionPass();
+    }
+
     bool occludesSegment(const glm::vec3& from, const glm::vec3& to, float clearance = 0.52f) const
     {
         glm::vec3 delta = to - from;

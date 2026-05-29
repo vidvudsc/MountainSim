@@ -13,6 +13,7 @@
 #include "camera.h"
 #include "common.h"
 #include "terrain.h"
+#include "weather.h"
 
 #include <algorithm>
 #include <array>
@@ -91,6 +92,27 @@ private:
     float erosionSpeed_ = 0.35f;
     bool framebufferResized_ = false;
 
+    // --- weather / microclimate ---
+    Weather weather_;
+    WeatherParams weatherParams_{};
+    bool weatherRunning_ = false;
+    int weatherGridXZ_ = 88;
+    int weatherGridY_ = 56;
+    bool showClouds_ = true;
+    bool showRain_ = true;
+    bool showSliceH_ = true;     // horizontal (Y) plane
+    bool showSliceV_ = true;     // vertical plane
+    int sliceH_ = 14;            // Y index for the horizontal plane
+    int vertAxis_ = 1;           // vertical plane normal: 0 = X, 1 = Z
+    int sliceV_ = 44;            // index of the vertical plane along its normal axis
+    bool showWindStreaks_ = true;
+    int weatherField_ = static_cast<int>(WeatherField::VerticalWind);
+    float rainErosionDrops_ = 9000.0f;
+    // temporally-smoothed colour range per field (kills slice flicker)
+    float fieldLo_[9] = {0};
+    float fieldHi_[9] = {0};
+    bool fieldRangeInit_[9] = {false};
+
     void initWindow()
     {
         if (!glfwInit()) throw std::runtime_error("Failed to initialize GLFW");
@@ -129,7 +151,50 @@ private:
         createDescriptorSets();
         createCommandBuffers();
         createSyncObjects();
+        initWeather();
     }
+
+    void initWeather()
+    {
+        float baseY = terrain_.minSurfaceHeight() - 4.0f;
+        float lidY = terrain_.maxSurfaceHeight() + 70.0f;
+        weather_.configure(weatherGridXZ_, weatherGridY_, weatherGridXZ_, baseY, lidY);
+        syncWeatherTerrain();
+        weather_.reset(weatherParams_);
+        sliceH_ = weather_.ny() / 4;
+        sliceV_ = weather_.nz() / 2;
+        weather_.startWorker();
+    }
+
+    void rebuildWeatherGrid()
+    {
+        bool wasRunning = weatherRunning_;
+        float baseY = terrain_.minSurfaceHeight() - 4.0f;
+        float lidY = terrain_.maxSurfaceHeight() + 70.0f;
+        weather_.configure(weatherGridXZ_, weatherGridY_, weatherGridXZ_, baseY, lidY);
+        syncWeatherTerrain();
+        weather_.reset(weatherParams_);
+        sliceH_ = glm::clamp(sliceH_, 0, weather_.ny() - 1);
+        sliceV_ = glm::clamp(sliceV_, 0, vertAxisCount() - 1);
+        weatherRunning_ = wasRunning;
+    }
+
+    void syncWeatherTerrain()
+    {
+        int nx = weather_.nx();
+        int nz = weather_.nz();
+        std::vector<float> cols(static_cast<std::size_t>(nx) * nz);
+        for (int k = 0; k < nz; ++k) {
+            for (int i = 0; i < nx; ++i) {
+                float wx = -kTerrainWorldSize * 0.5f + (i + 0.5f) / nx * kTerrainWorldSize;
+                float wz = -kTerrainWorldSize * 0.5f + (k + 0.5f) / nz * kTerrainWorldSize;
+                cols[static_cast<std::size_t>(k) * nx + i] = terrain_.surfaceHeightAtWorld(wx, wz);
+            }
+        }
+        weather_.setColumnHeights(cols);
+    }
+
+    int vertAxisCount() const { return vertAxis_ == 0 ? weather_.nx() : weather_.nz(); }
 
     void createInstance()
     {
@@ -1096,6 +1161,9 @@ private:
             erosionAnimating_ = false;
             terrain_.generate(editable);
             terrainDirty_ = true;
+            // New terrain -> rebuild the weather box (base/lid follow terrain height)
+            // and regenerate the airmass so clouds form over the new mountains.
+            if (weather_.ready()) rebuildWeatherGrid();
         } else {
             terrain_.settings() = editable;
         }
@@ -1185,6 +1253,342 @@ private:
         }
     }
 
+    glm::mat4 sceneProj() const
+    {
+        float aspect = static_cast<float>(std::max(1u, swapchainExtent_.width)) / static_cast<float>(std::max(1u, swapchainExtent_.height));
+        glm::mat4 proj = glm::perspective(glm::radians(58.0f), aspect, 0.1f, 650.0f);
+        proj[1][1] *= -1.0f;
+        return proj;
+    }
+
+    // Cheap projection for volumetric splats: in front of camera + roughly on-screen.
+    bool projectVolume(const glm::vec3& world, const glm::mat4& viewProj, ImVec2& screen, float& depth) const
+    {
+        glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
+        if (clip.w <= 0.05f) return false;
+        glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        if (ndc.x < -1.15f || ndc.x > 1.15f || ndc.y < -1.15f || ndc.y > 1.15f || ndc.z < 0.0f || ndc.z > 1.0f) return false;
+        ImVec2 size = ImGui::GetIO().DisplaySize;
+        screen.x = (ndc.x * 0.5f + 0.5f) * size.x;
+        screen.y = (ndc.y * 0.5f + 0.5f) * size.y;
+        depth = clip.w;
+        return true;
+    }
+
+    static ImU32 colormap(float t, float alpha = 1.0f)
+    {
+        t = glm::clamp(t, 0.0f, 1.0f);
+        // simple blue -> cyan -> green -> yellow -> red ramp
+        glm::vec3 c;
+        if (t < 0.25f) c = glm::mix(glm::vec3(0.10f, 0.12f, 0.55f), glm::vec3(0.0f, 0.65f, 0.85f), t / 0.25f);
+        else if (t < 0.5f) c = glm::mix(glm::vec3(0.0f, 0.65f, 0.85f), glm::vec3(0.15f, 0.80f, 0.20f), (t - 0.25f) / 0.25f);
+        else if (t < 0.75f) c = glm::mix(glm::vec3(0.15f, 0.80f, 0.20f), glm::vec3(0.95f, 0.85f, 0.10f), (t - 0.5f) / 0.25f);
+        else c = glm::mix(glm::vec3(0.95f, 0.85f, 0.10f), glm::vec3(0.90f, 0.15f, 0.10f), (t - 0.75f) / 0.25f);
+        return IM_COL32(static_cast<int>(c.r * 255), static_cast<int>(c.g * 255), static_cast<int>(c.b * 255), static_cast<int>(alpha * 255));
+    }
+
+    // True if the terrain surface blocks the straight line from the camera to P.
+    bool occludedByTerrain(const glm::vec3& P) const
+    {
+        glm::vec3 o = camera_.position;
+        glm::vec3 d = P - o;
+        float dist = glm::length(d);
+        if (dist < 1e-3f) return false;
+        d /= dist;
+        float halfW = kTerrainWorldSize * 0.5f + 2.0f;
+        const int steps = 14;
+        for (int s = 1; s < steps; ++s) {
+            float t = dist * (static_cast<float>(s) / steps);
+            glm::vec3 q = o + d * t;
+            if (std::abs(q.x) > halfW || std::abs(q.z) > halfW) continue;
+            if (q.y < terrain_.surfaceHeightAtWorld(q.x, q.z) - 0.4f) return true;
+        }
+        return false;
+    }
+
+    void updateWeather(float)
+    {
+        if (!weather_.ready()) return;
+        // The solver runs on its own thread; we only hand it inputs and always display
+        // the latest finished snapshot.
+        weather_.setControls(weatherRunning_, weatherParams_, sunDirection());
+        weather_.setViewFrame(-1);
+    }
+
+    void drawWeatherControls()
+    {
+        ImGui::SetNextWindowPos(ImVec2(712, 18), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(346, 430), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Weather");
+        ImGui::Text("sim time: %.0f s   grid %dx%dx%d", weather_.simTime(), weather_.nx(), weather_.ny(), weather_.nz());
+        ImGui::Text("boxes: %d", weather_.nx() * weather_.ny() * weather_.nz());
+        if (ImGui::Button(weatherRunning_ ? "Pause" : "Run")) weatherRunning_ = !weatherRunning_;
+        ImGui::SameLine();
+        if (ImGui::Button("Reset")) { weather_.reset(weatherParams_); }
+        ImGui::SameLine();
+        if (ImGui::Button("Re-sync terrain")) syncWeatherTerrain();
+
+        ImGui::SeparatorText("Airmass / inflow");
+        ImGui::SliderFloat("Wind speed", &weatherParams_.windSpeed, 0.0f, 18.0f, "%.1f m/s");
+        ImGui::SliderFloat("Wind dir", &weatherParams_.windDirDeg, -180.0f, 180.0f, "%.0f deg");
+        ImGui::SliderFloat("Inflow RH", &weatherParams_.inflowRH, 0.05f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Surface temp", &weatherParams_.surfaceTempC, -10.0f, 35.0f, "%.1f C");
+        ImGui::SliderFloat("Stability", &weatherParams_.thetaLapse, -0.002f, 0.012f, "%.4f K/m");
+
+        ImGui::SeparatorText("Surface energy");
+        ImGui::SliderFloat("Solar heating", &weatherParams_.solarHeating, 0.0f, 0.04f, "%.3f K/s");
+        ImGui::SliderFloat("IR cooling", &weatherParams_.irCooling, 0.0f, 0.012f, "%.4f K/s");
+        ImGui::SliderFloat("Surface drag", &weatherParams_.surfaceDrag, 0.0f, 2.0f, "%.2f");
+        ImGui::SliderFloat("Wind nudge", &weatherParams_.windNudge, 0.0f, 1.0f, "%.2f");
+
+        ImGui::SeparatorText("Moisture");
+        ImGui::SliderFloat("Rain fall speed", &weatherParams_.rainFall, 1.0f, 12.0f, "%.1f m/s");
+        ImGui::SliderFloat("Autoconversion", &weatherParams_.autoconv, 0.0f, 0.006f, "%.4f");
+        ImGui::SliderFloat("Rain evap", &weatherParams_.rainEvap, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Buoyancy", &weatherParams_.buoyancy, 0.0f, 2.5f, "%.2f");
+
+        ImGui::SeparatorText("Solver");
+        ImGui::SliderInt("Pressure iters", &weatherParams_.pressureIters, 6, 60);
+        ImGui::SliderFloat("Time scale", &weatherParams_.timeScale, 1.0f, 120.0f, "%.0f x");
+        ImGui::SliderInt("Grid XZ", &weatherGridXZ_, 32, 144);
+        ImGui::SliderInt("Grid Y", &weatherGridY_, 24, 96);
+        if (ImGui::Button("Apply grid")) rebuildWeatherGrid();
+
+        ImGui::SeparatorText("Couple to terrain");
+        ImGui::SliderFloat("Erosion drops", &rainErosionDrops_, 1000.0f, 40000.0f, "%.0f");
+        if (ImGui::Button("Rain carves terrain")) {
+            terrain_.erodeWeighted(weather_.precipWeights(), weather_.nx(), weather_.nz(), static_cast<int>(rainErosionDrops_));
+            terrainDirty_ = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear precip")) weather_.clearPrecipAccum();
+        ImGui::End();
+
+        drawSlicePanel();
+    }
+
+    void drawSlicePanel()
+    {
+        ImGui::SetNextWindowPos(ImVec2(712, 458), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(346, 300), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Slices & view");
+        ImGui::Checkbox("Clouds", &showClouds_); ImGui::SameLine();
+        ImGui::Checkbox("Rain", &showRain_); ImGui::SameLine();
+        ImGui::Checkbox("Wind", &showWindStreaks_);
+
+        const char* fields[] = {"Temperature", "Theta pert", "Vertical wind", "Wind speed", "Vapor", "Rel humidity", "Cloud", "Rain", "Vorticity"};
+        ImGui::Combo("Field", &weatherField_, fields, IM_ARRAYSIZE(fields));
+
+        ImGui::SeparatorText("Horizontal slice");
+        ImGui::Checkbox("Show##h", &showSliceH_); ImGui::SameLine();
+        ImGui::SliderInt("Height (Y)", &sliceH_, 0, std::max(0, weather_.ny() - 1));
+
+        ImGui::SeparatorText("Vertical slice");
+        ImGui::Checkbox("Show##v", &showSliceV_); ImGui::SameLine();
+        const char* vaxes[] = {"X-normal", "Z-normal"};
+        if (ImGui::Combo("Facing", &vertAxis_, vaxes, IM_ARRAYSIZE(vaxes)))
+            sliceV_ = glm::clamp(sliceV_, 0, vertAxisCount() - 1);
+        ImGui::SliderInt("Position", &sliceV_, 0, std::max(0, vertAxisCount() - 1));
+        ImGui::End();
+    }
+
+
+    // Temporally-smoothed [lo,hi] per field so the slice colours don't flash as the
+    // instantaneous min/max jitters frame to frame.
+    void stableColorRange(WeatherField field, float& outLo, float& outHi)
+    {
+        int nx = weather_.nx(), ny = weather_.ny(), nz = weather_.nz();
+        float lo = 1e30f, hi = -1e30f;
+        auto visit = [&](int i, int j, int k) {
+            if (weather_.isSolid(i, j, k)) return;
+            float val = weather_.sample(field, i, j, k, weatherParams_);
+            lo = std::min(lo, val); hi = std::max(hi, val);
+        };
+        if (showSliceH_) { int j = glm::clamp(sliceH_, 0, ny - 1); for (int k = 0; k < nz; ++k) for (int i = 0; i < nx; ++i) visit(i, j, k); }
+        if (showSliceV_) {
+            int s = glm::clamp(sliceV_, 0, vertAxisCount() - 1);
+            if (vertAxis_ == 0) { for (int k = 0; k < nz; ++k) for (int j = 0; j < ny; ++j) visit(s, j, k); }
+            else { for (int i = 0; i < nx; ++i) for (int j = 0; j < ny; ++j) visit(i, j, s); }
+        }
+        int f = static_cast<int>(field);
+        if (hi < lo) { outLo = fieldLo_[f]; outHi = fieldHi_[f]; return; }
+        if (!fieldRangeInit_[f]) { fieldLo_[f] = lo; fieldHi_[f] = hi; fieldRangeInit_[f] = true; }
+        else {
+            float a = 0.06f; // EMA-smooth the color range to kill per-frame flicker
+            fieldLo_[f] += (lo - fieldLo_[f]) * a;
+            fieldHi_[f] += (hi - fieldHi_[f]) * a;
+        }
+        outLo = fieldLo_[f];
+        outHi = std::max(fieldLo_[f] + 1e-4f, fieldHi_[f]);
+    }
+
+    // A continuous, gouraud-shaded slice plane (no gaps). `cellAt(a,b)` maps plane
+    // coordinates to grid cells; A*B is the node grid. Terrain occlusion and solid
+    // cells fade the corner alpha so the plane is cut away cleanly behind mountains.
+    template <class CellFn>
+    void drawSlicePlane(ImDrawList* dl, const glm::mat4& viewProj, WeatherField field,
+                        float lo, float hi, int A, int B, CellFn cellAt)
+    {
+        if (A < 2 || B < 2) return;
+        float range = std::max(1e-4f, hi - lo);
+        std::vector<ImVec2> pos(static_cast<std::size_t>(A) * B);
+        std::vector<ImU32> col(static_cast<std::size_t>(A) * B);
+        std::vector<std::uint8_t> ok(static_cast<std::size_t>(A) * B, 0);
+        for (int b = 0; b < B; ++b) {
+            for (int a = 0; a < A; ++a) {
+                int i, j, k; cellAt(a, b, i, j, k);
+                std::size_t n = static_cast<std::size_t>(b) * A + a;
+                glm::vec3 c = weather_.cellCenter(i, j, k);
+                ImVec2 sc; float depth;
+                if (!projectVolume(c, viewProj, sc, depth)) { ok[n] = 0; continue; }
+                float alpha = 0.60f;
+                if (weather_.isSolid(i, j, k) || occludedByTerrain(c)) alpha = 0.0f;
+                float t = (weather_.sample(field, i, j, k, weatherParams_) - lo) / range;
+                pos[n] = sc;
+                col[n] = colormap(t, alpha);
+                ok[n] = 1;
+            }
+        }
+        ImVec2 uv = ImGui::GetIO().Fonts->TexUvWhitePixel;
+        for (int b = 0; b < B - 1; ++b) {
+            for (int a = 0; a < A - 1; ++a) {
+                std::size_t n00 = static_cast<std::size_t>(b) * A + a;
+                std::size_t n10 = n00 + 1;
+                std::size_t n01 = n00 + A;
+                std::size_t n11 = n01 + 1;
+                if (!(ok[n00] && ok[n10] && ok[n01] && ok[n11])) continue;
+                if (((col[n00] | col[n10] | col[n01] | col[n11]) & IM_COL32_A_MASK) == 0) continue;
+                dl->PrimReserve(6, 4);
+                unsigned int base = dl->_VtxCurrentIdx;
+                dl->PrimWriteVtx(pos[n00], uv, col[n00]);
+                dl->PrimWriteVtx(pos[n10], uv, col[n10]);
+                dl->PrimWriteVtx(pos[n11], uv, col[n11]);
+                dl->PrimWriteVtx(pos[n01], uv, col[n01]);
+                dl->PrimWriteIdx((ImDrawIdx)(base + 0)); dl->PrimWriteIdx((ImDrawIdx)(base + 1)); dl->PrimWriteIdx((ImDrawIdx)(base + 2));
+                dl->PrimWriteIdx((ImDrawIdx)(base + 0)); dl->PrimWriteIdx((ImDrawIdx)(base + 2)); dl->PrimWriteIdx((ImDrawIdx)(base + 3));
+            }
+        }
+    }
+
+    template <class CellFn>
+    void drawWindStreaksOnPlane(ImDrawList* dl, const glm::mat4& viewProj, int A, int B, int stride,
+                                CellFn cellAt)
+    {
+        for (int b = 0; b < B; b += stride) {
+            for (int a = 0; a < A; a += stride) {
+                int i, j, k; cellAt(a, b, i, j, k);
+                if (weather_.isSolid(i, j, k)) continue;
+                glm::vec3 c = weather_.cellCenter(i, j, k);
+                if (occludedByTerrain(c)) continue;
+                glm::vec3 vel = weather_.velocity(i, j, k);
+                glm::vec3 tip = c + vel * 0.9f;
+                ImVec2 pa, pb; float da, db;
+                if (!projectVolume(c, viewProj, pa, da) || !projectVolume(tip, viewProj, pb, db)) continue;
+                dl->AddLine(pa, pb, IM_COL32(250, 250, 255, 150), 1.0f);
+                dl->AddCircleFilled(pb, 1.4f, IM_COL32(255, 240, 200, 180));
+            }
+        }
+    }
+
+    void drawWeatherOverlay()
+    {
+        if (!weather_.ready()) return;
+        glm::mat4 viewProj = sceneProj() * camera_.view();
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        int nx = weather_.nx(), ny = weather_.ny(), nz = weather_.nz();
+        WeatherField field = static_cast<WeatherField>(weatherField_);
+
+        // --- slice planes (continuous, gouraud) ---
+        if (showSliceH_ || showSliceV_) {
+            float lo, hi; stableColorRange(field, lo, hi);
+            if (showSliceH_) {
+                int j = glm::clamp(sliceH_, 0, ny - 1);
+                drawSlicePlane(dl, viewProj, field, lo, hi, nx, nz,
+                               [&](int a, int b, int& i, int& jj, int& k) { i = a; jj = j; k = b; });
+            }
+            if (showSliceV_) {
+                int s = glm::clamp(sliceV_, 0, vertAxisCount() - 1);
+                if (vertAxis_ == 0)
+                    drawSlicePlane(dl, viewProj, field, lo, hi, ny, nz,
+                                   [&](int a, int b, int& i, int& jj, int& k) { i = s; jj = a; k = b; });
+                else
+                    drawSlicePlane(dl, viewProj, field, lo, hi, nx, ny,
+                                   [&](int a, int b, int& i, int& jj, int& k) { i = a; jj = b; k = s; });
+            }
+        }
+
+        // --- volumetric clouds: depth-sorted soft billboards (back-to-front) ---
+        if (showClouds_) {
+            float dxz = kTerrainWorldSize / static_cast<float>(nx);
+            struct Puff { float depth; ImVec2 sc; float sz; float a; };
+            static std::vector<Puff> puffs;
+            puffs.clear();
+            for (int k = 0; k < nz; ++k)
+                for (int j = 0; j < ny; ++j)
+                    for (int i = 0; i < nx; ++i) {
+                        if (weather_.isSolid(i, j, k)) continue;
+                        float qc = weather_.cloudAt(i, j, k);
+                        if (qc <= 2.0e-5f) continue;
+                        glm::vec3 c = weather_.cellCenter(i, j, k);
+                        if (occludedByTerrain(c)) continue;
+                        ImVec2 sc; float depth;
+                        if (!projectVolume(c, viewProj, sc, depth)) continue;
+                        float screenPerWorld = (ImGui::GetIO().DisplaySize.y * 0.5f) / (depth * 0.554f);
+                        float sz = glm::clamp(dxz * screenPerWorld * 0.85f, 2.0f, 40.0f);
+                        float a = glm::clamp(qc * 7000.0f, 0.05f, 0.55f);
+                        puffs.push_back({depth, sc, sz, a});
+                    }
+            std::sort(puffs.begin(), puffs.end(), [](const Puff& x, const Puff& y) { return x.depth > y.depth; });
+            for (const Puff& p : puffs) {
+                int ao = static_cast<int>(p.a * 0.55f * 255.0f);
+                int ai = static_cast<int>(p.a * 255.0f);
+                dl->AddCircleFilled(p.sc, p.sz, IM_COL32(236, 240, 248, ao), 12);
+                dl->AddCircleFilled(p.sc, p.sz * 0.55f, IM_COL32(250, 252, 255, ai), 10);
+            }
+        }
+
+        // --- rain streaks ---
+        if (showRain_) {
+            int drawn = 0;
+            for (int k = 0; k < nz && drawn < 9000; ++k)
+                for (int j = 0; j < ny; ++j)
+                    for (int i = 0; i < nx; ++i) {
+                        if (weather_.isSolid(i, j, k)) continue;
+                        float qr = weather_.rainAt(i, j, k);
+                        if (qr <= 6.0e-5f) continue;
+                        glm::vec3 c = weather_.cellCenter(i, j, k);
+                        if (occludedByTerrain(c)) continue;
+                        ImVec2 sc; float depth;
+                        if (!projectVolume(c, viewProj, sc, depth)) continue;
+                        float sz = glm::clamp(1100.0f / depth, 2.0f, 14.0f);
+                        float a = glm::clamp(qr * 9000.0f, 0.10f, 0.7f);
+                        dl->AddLine(ImVec2(sc.x, sc.y - sz * 0.6f), ImVec2(sc.x, sc.y + sz * 0.9f),
+                                    IM_COL32(120, 150, 210, static_cast<int>(a * 255)), 1.4f);
+                        ++drawn;
+                    }
+        }
+
+        // --- wind streaks on whichever planes are shown ---
+        if (showWindStreaks_) {
+            int strideXZ = std::max(1, nx / 26);
+            int strideY = std::max(1, ny / 20);
+            if (showSliceH_) {
+                int j = glm::clamp(sliceH_, 0, ny - 1);
+                drawWindStreaksOnPlane(dl, viewProj, nx, nz, strideXZ,
+                                       [&](int a, int b, int& i, int& jj, int& k) { i = a; jj = j; k = b; });
+            }
+            if (showSliceV_) {
+                int s = glm::clamp(sliceV_, 0, vertAxisCount() - 1);
+                if (vertAxis_ == 0)
+                    drawWindStreaksOnPlane(dl, viewProj, ny, nz, strideY,
+                                           [&](int a, int b, int& i, int& jj, int& k) { i = s; jj = a; k = b; });
+                else
+                    drawWindStreaksOnPlane(dl, viewProj, nx, ny, strideXZ,
+                                           [&](int a, int b, int& i, int& jj, int& k) { i = a; jj = b; k = s; });
+            }
+        }
+    }
+
     void recordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex)
     {
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1231,7 +1635,7 @@ private:
             checkVk(acquire, "Failed to acquire swapchain image");
         }
         vkResetFences(device_, 1, &inFlight_[currentFrame_]);
-        if (terrainDirty_) uploadTerrain();
+        if (terrainDirty_) { uploadTerrain(); syncWeatherTerrain(); }
         updateUniformBuffer(static_cast<std::uint32_t>(currentFrame_));
         vkResetCommandBuffer(commandBuffers_[currentFrame_], 0);
         recordCommandBuffer(commandBuffers_[currentFrame_], imageIndex);
@@ -1275,8 +1679,11 @@ private:
             ImGui::NewFrame();
             processInput(dt);
             updateErosionAnimation();
+            updateWeather(dt);
             drawControls();
+            drawWeatherControls();
             drawFlowOverlay();
+            drawWeatherOverlay();
             ImGui::Render();
             drawFrame();
         }
@@ -1285,6 +1692,7 @@ private:
 
     void cleanup()
     {
+        weather_.stopWorker();
         ImGui_ImplVulkan_Shutdown();
         ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
