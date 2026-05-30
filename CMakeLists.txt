@@ -49,6 +49,8 @@ set(VULKAN_SHADERS
   ${SHADER_SOURCE_DIR}/sky.frag
   ${SHADER_SOURCE_DIR}/cloud.vert
   ${SHADER_SOURCE_DIR}/cloud.frag
+  ${SHADER_SOURCE_DIR}/slice.vert
+  ${SHADER_SOURCE_DIR}/slice.frag
   ${SHADER_SOURCE_DIR}/terrain.vert
   ${SHADER_SOURCE_DIR}/terrain.frag
 )

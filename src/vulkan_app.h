@@ -133,6 +133,16 @@ private:
     VkDeviceMemory cloudHeightMemory_ = VK_NULL_HANDLE;
     void* cloudHeightMapped_ = nullptr;
 
+    // --- field slice planes drawn as depth-tested 3D geometry (clean per-pixel terrain
+    //     cutout, vs. the old per-vertex ImGui-overlay occlusion which was blocky) ---
+    struct SliceVertex { glm::vec3 pos; glm::vec4 color; };
+    static constexpr int kSliceMaxVerts = 2 * 144 * 144 * 6; // both planes, worst-case grid
+    VkPipeline slicePipeline_ = VK_NULL_HANDLE;
+    std::array<VkBuffer, kMaxFramesInFlight> sliceVertexBuffers_{};
+    std::array<VkDeviceMemory, kMaxFramesInFlight> sliceVertexMemories_{};
+    std::array<void*, kMaxFramesInFlight> sliceVertexMapped_{};
+    std::array<std::uint32_t, kMaxFramesInFlight> sliceVertexCount_{};
+
     void initWindow()
     {
         if (!glfwInit()) throw std::runtime_error("Failed to initialize GLFW");
@@ -163,6 +173,7 @@ private:
         createCloudDescriptorSetLayout();
         createPipeline();
         createCloudPipeline();
+        createSlicePipeline();
         createDepthResources();
         createFramebuffers();
         createCommandPool();
@@ -806,6 +817,150 @@ private:
         int cells = weather_.nx() * weather_.ny() * weather_.nz();
         if (cells <= 0 || cells > kCloudMaxCells) return;
         weather_.copyCloudField(static_cast<float*>(cloudFieldMapped_[frame]));
+    }
+
+    // ---- depth-tested 3D field-slice planes ------------------------------------------------
+    void createSlicePipeline()
+    {
+        VkShaderModule vert = createShaderModule(readBinaryFile(std::string(SHADER_BINARY_DIR) + "/slice.vert.spv"));
+        VkShaderModule frag = createShaderModule(readBinaryFile(std::string(SHADER_BINARY_DIR) + "/slice.frag.spv"));
+        VkPipelineShaderStageCreateInfo vertStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT; vertStage.module = vert; vertStage.pName = "main";
+        VkPipelineShaderStageCreateInfo fragStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT; fragStage.module = frag; fragStage.pName = "main";
+        std::array<VkPipelineShaderStageCreateInfo, 2> stages{vertStage, fragStage};
+
+        VkVertexInputBindingDescription binding{0, sizeof(SliceVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+        std::array<VkVertexInputAttributeDescription, 2> attributes{{
+            {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(SliceVertex, pos)},
+            {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(SliceVertex, color)},
+        }};
+        VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        vertexInput.vertexBindingDescriptionCount = 1;
+        vertexInput.pVertexBindingDescriptions = &binding;
+        vertexInput.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());
+        vertexInput.pVertexAttributeDescriptions = attributes.data();
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewportState.viewportCount = 1; viewportState.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.polygonMode = VK_POLYGON_MODE_FILL; raster.cullMode = VK_CULL_MODE_NONE;
+        raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; raster.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        // Depth-test against the terrain (drawn earlier in the pass) for a clean per-pixel
+        // cutout, but don't write depth so the translucent slice can't occlude later draws.
+        VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        depth.depthTestEnable = VK_TRUE;
+        depth.depthWriteEnable = VK_FALSE;
+        depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        VkPipelineColorBlendAttachmentState blendAttachment{};
+        blendAttachment.blendEnable = VK_TRUE;
+        blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+        blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+        blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        blend.attachmentCount = 1; blend.pAttachments = &blendAttachment;
+        std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
+        dynamic.pDynamicStates = dynamicStates.data();
+        VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
+        pipelineInfo.pStages = stages.data();
+        pipelineInfo.pVertexInputState = &vertexInput;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &raster;
+        pipelineInfo.pMultisampleState = &multisample;
+        pipelineInfo.pDepthStencilState = &depth;
+        pipelineInfo.pColorBlendState = &blend;
+        pipelineInfo.pDynamicState = &dynamic;
+        pipelineInfo.layout = pipelineLayout_; // reuses the scene UBO (view/proj)
+        pipelineInfo.renderPass = renderPass_;
+        pipelineInfo.subpass = 0;
+        checkVk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &slicePipeline_), "Failed to create slice pipeline");
+        vkDestroyShaderModule(device_, vert, nullptr);
+        vkDestroyShaderModule(device_, frag, nullptr);
+    }
+
+    void createSliceResources()
+    {
+        VkDeviceSize bytes = static_cast<VkDeviceSize>(kSliceMaxVerts) * sizeof(SliceVertex);
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            createBuffer(bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         sliceVertexBuffers_[i], sliceVertexMemories_[i]);
+            vkMapMemory(device_, sliceVertexMemories_[i], 0, bytes, 0, &sliceVertexMapped_[i]);
+            sliceVertexCount_[i] = 0;
+        }
+    }
+
+    // Generate this frame's slice triangles (world-space pos + field color) into the mapped
+    // vertex buffer. The GPU then depth-tests them against the terrain for a clean cutout.
+    void buildSliceGeometry(std::uint32_t frame)
+    {
+        sliceVertexCount_[frame] = 0;
+        if (!weather_.ready() || !sliceVertexMapped_[frame]) return;
+        if (!showSliceH_ && !showSliceV_) return;
+        int nx = weather_.nx(), ny = weather_.ny(), nz = weather_.nz();
+        WeatherField field = static_cast<WeatherField>(weatherField_);
+        float lo, hi; stableColorRange(field, lo, hi);
+        float range = std::max(1e-4f, hi - lo);
+        auto* verts = static_cast<SliceVertex*>(sliceVertexMapped_[frame]);
+        std::uint32_t n = 0;
+        const float alpha = 0.6f;
+
+        auto colorAt = [&](int i, int j, int k) {
+            float t = (weather_.sample(field, i, j, k, weatherParams_) - lo) / range;
+            t = glm::clamp(t, 0.0f, 1.0f);
+            glm::vec3 c;
+            if (t < 0.25f) c = glm::mix(glm::vec3(0.10f, 0.12f, 0.55f), glm::vec3(0.0f, 0.65f, 0.85f), t / 0.25f);
+            else if (t < 0.5f) c = glm::mix(glm::vec3(0.0f, 0.65f, 0.85f), glm::vec3(0.15f, 0.80f, 0.20f), (t - 0.25f) / 0.25f);
+            else if (t < 0.75f) c = glm::mix(glm::vec3(0.15f, 0.80f, 0.20f), glm::vec3(0.95f, 0.85f, 0.10f), (t - 0.5f) / 0.25f);
+            else c = glm::mix(glm::vec3(0.95f, 0.85f, 0.10f), glm::vec3(0.90f, 0.15f, 0.10f), (t - 0.75f) / 0.25f);
+            return glm::vec4(c, alpha);
+        };
+
+        // Emit one quad (2 triangles) per cell of the plane, skipping quads that touch a solid
+        // cell so we never colour points buried in terrain (the depth test trims the rest).
+        auto emitQuad = [&](int i0, int j0, int k0, int i1, int j1, int k1,
+                            int i2, int j2, int k2, int i3, int j3, int k3) {
+            if (n + 6 > static_cast<std::uint32_t>(kSliceMaxVerts)) return;
+            if (weather_.isSolid(i0, j0, k0) || weather_.isSolid(i1, j1, k1) ||
+                weather_.isSolid(i2, j2, k2) || weather_.isSolid(i3, j3, k3)) return;
+            SliceVertex v0{weather_.cellCenter(i0, j0, k0), colorAt(i0, j0, k0)};
+            SliceVertex v1{weather_.cellCenter(i1, j1, k1), colorAt(i1, j1, k1)};
+            SliceVertex v2{weather_.cellCenter(i2, j2, k2), colorAt(i2, j2, k2)};
+            SliceVertex v3{weather_.cellCenter(i3, j3, k3), colorAt(i3, j3, k3)};
+            verts[n++] = v0; verts[n++] = v1; verts[n++] = v2;
+            verts[n++] = v0; verts[n++] = v2; verts[n++] = v3;
+        };
+
+        if (showSliceH_) {
+            int j = glm::clamp(sliceH_, 0, ny - 1);
+            for (int k = 0; k < nz - 1; ++k)
+                for (int i = 0; i < nx - 1; ++i)
+                    emitQuad(i, j, k, i + 1, j, k, i + 1, j, k + 1, i, j, k + 1);
+        }
+        if (showSliceV_) {
+            int s = glm::clamp(sliceV_, 0, vertAxisCount() - 1);
+            if (vertAxis_ == 0) { // X-normal plane: spans (j,k)
+                for (int k = 0; k < nz - 1; ++k)
+                    for (int j = 0; j < ny - 1; ++j)
+                        emitQuad(s, j, k, s, j + 1, k, s, j + 1, k + 1, s, j, k + 1);
+            } else {              // Z-normal plane: spans (i,j)
+                for (int i = 0; i < nx - 1; ++i)
+                    for (int j = 0; j < ny - 1; ++j)
+                        emitQuad(i, j, s, i + 1, j, s, i + 1, j + 1, s, i, j + 1, s);
+            }
+        }
+        sliceVertexCount_[frame] = n;
     }
 
     std::uint32_t findMemoryType(std::uint32_t typeFilter, VkMemoryPropertyFlags properties)
@@ -1507,7 +1662,10 @@ private:
         return IM_COL32(static_cast<int>(c.r * 255), static_cast<int>(c.g * 255), static_cast<int>(c.b * 255), static_cast<int>(alpha * 255));
     }
 
-    // True if the terrain surface blocks the straight line from the camera to P.
+    // True if the terrain surface blocks the straight line from the camera to P. Marches at a
+    // fixed world-space resolution (rather than a fixed step count) so that even distant points
+    // are sampled finely enough that the ray can't skip clean over a ridge -- the coarse
+    // 14-step version let slice planes and wind streaks bleed through the mountains.
     bool occludedByTerrain(const glm::vec3& P) const
     {
         glm::vec3 o = camera_.position;
@@ -1515,13 +1673,14 @@ private:
         float dist = glm::length(d);
         if (dist < 1e-3f) return false;
         d /= dist;
-        float halfW = kTerrainWorldSize * 0.5f + 2.0f;
-        const int steps = 14;
+        const float halfW = kTerrainWorldSize * 0.5f + 2.0f;
+        const float stepLen = 1.5f; // world units between samples
+        int steps = glm::clamp(static_cast<int>(dist / stepLen), 12, 96);
         for (int s = 1; s < steps; ++s) {
-            float t = dist * (static_cast<float>(s) / steps);
+            float t = dist * (static_cast<float>(s) / static_cast<float>(steps));
             glm::vec3 q = o + d * t;
             if (std::abs(q.x) > halfW || std::abs(q.z) > halfW) continue;
-            if (q.y < terrain_.surfaceHeightAtWorld(q.x, q.z) - 0.4f) return true;
+            if (q.y < terrain_.surfaceHeightAtWorld(q.x, q.z) - 0.25f) return true;
         }
         return false;
     }
