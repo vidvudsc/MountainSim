@@ -6,13 +6,6 @@ temperature, and moisture — so that clouds and rain *emerge from the physics* 
 forced up over the terrain, rendered with ray-marched volumetric clouds. Built in C++20 on
 Vulkan via MoltenVK on macOS (Apple Silicon).
 
-> This is the **spiritual predecessor** of
-> [**Mountain-weather**](https://github.com/vidvudsc/Mountain-weather) — the later C / raylib
-> reimplementation of the same idea. MountainSim is the original C++/Vulkan exploration that
-> the concept grew out of.
-
----
-
 ## What it does
 
 - **Procedural terrain** — layered Perlin noise with octaves/lacunarity/persistence controls,
