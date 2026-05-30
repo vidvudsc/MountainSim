@@ -28,14 +28,16 @@
 struct WeatherParams {
     float windSpeed = 7.0f;       // m/s prevailing inflow
     float windDirDeg = 20.0f;     // 0 -> blowing toward +x
-    float inflowRH = 0.85f;       // relative humidity of incoming air (moist enough that
-                                  // realistic orographic lift reaches saturation over peaks)
+    float inflowRH = 0.92f;       // relative humidity of incoming air (moist enough that the
+                                  // convective overturning below still condenses visible cloud)
     float surfaceTempC = 14.0f;   // base surface temperature
-    float thetaLapse = 0.0050f;   // K/m potential-temperature gradient (stability)
+    float thetaLapse = 0.0040f;   // K/m potential-temperature gradient (stability) -- slightly
+                                  // less stable so daytime heating drives real convection
     float solarHeating = 0.010f;  // K/s surface heating at full incidence
     float irCooling = 0.0035f;    // K/s longwave surface cooling
     float surfaceDrag = 0.8f;     // 1/s friction in the surface layer
-    float windNudge = 0.18f;      // 1/s relaxation of interior wind toward prevailing
+    float windNudge = 0.10f;      // 1/s relaxation of interior wind toward prevailing (gentle
+                                  // so thermally-driven circulations aren't damped back flat)
     float rainFall = 6.0f;        // m/s rain terminal velocity
     float autoconv = 0.0016f;     // 1/s cloud -> rain conversion
     float autoThresh = 0.0001f;   // kg/kg cloud water threshold for autoconversion (0.1 g/kg)
@@ -739,9 +741,11 @@ private:
             if (!solid_[c]) v_[c] = 0.0f;
         });
 
-        // 9. Sub-grid mixing (poor-man's Smagorinsky) damps grid-scale noise.
-        diffuse(u_, 0.04f); diffuse(v_, 0.04f); diffuse(w_, 0.04f);
-        diffuse(theta_, 0.02f); diffuse(qv_, 0.02f);
+        // 9. Sub-grid mixing (poor-man's Smagorinsky) damps grid-scale noise. Kept light so
+        //    eddies and convective cells survive and keep visibly evolving rather than being
+        //    smoothed into a static blanket.
+        diffuse(u_, 0.022f); diffuse(v_, 0.022f); diffuse(w_, 0.022f);
+        diffuse(theta_, 0.012f); diffuse(qv_, 0.012f);
 
         // 9. Outflow.
         zeroGradientOutflow(p);
