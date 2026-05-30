@@ -174,6 +174,7 @@ private:
         createPipeline();
         createCloudPipeline();
         createSlicePipeline();
+        createSliceResources();
         createDepthResources();
         createFramebuffers();
         createCommandPool();
@@ -927,13 +928,11 @@ private:
             return glm::vec4(c, alpha);
         };
 
-        // Emit one quad (2 triangles) per cell of the plane, skipping quads that touch a solid
-        // cell so we never colour points buried in terrain (the depth test trims the rest).
+        // Emit one quad (2 triangles) per cell of the plane. The depth test against the
+        // terrain (drawn earlier in the pass) clips per-pixel for a clean mountain cutout.
         auto emitQuad = [&](int i0, int j0, int k0, int i1, int j1, int k1,
                             int i2, int j2, int k2, int i3, int j3, int k3) {
             if (n + 6 > static_cast<std::uint32_t>(kSliceMaxVerts)) return;
-            if (weather_.isSolid(i0, j0, k0) || weather_.isSolid(i1, j1, k1) ||
-                weather_.isSolid(i2, j2, k2) || weather_.isSolid(i3, j3, k3)) return;
             SliceVertex v0{weather_.cellCenter(i0, j0, k0), colorAt(i0, j0, k0)};
             SliceVertex v1{weather_.cellCenter(i1, j1, k1), colorAt(i1, j1, k1)};
             SliceVertex v2{weather_.cellCenter(i2, j2, k2), colorAt(i2, j2, k2)};
@@ -1650,18 +1649,6 @@ private:
         return true;
     }
 
-    static ImU32 colormap(float t, float alpha = 1.0f)
-    {
-        t = glm::clamp(t, 0.0f, 1.0f);
-        // simple blue -> cyan -> green -> yellow -> red ramp
-        glm::vec3 c;
-        if (t < 0.25f) c = glm::mix(glm::vec3(0.10f, 0.12f, 0.55f), glm::vec3(0.0f, 0.65f, 0.85f), t / 0.25f);
-        else if (t < 0.5f) c = glm::mix(glm::vec3(0.0f, 0.65f, 0.85f), glm::vec3(0.15f, 0.80f, 0.20f), (t - 0.25f) / 0.25f);
-        else if (t < 0.75f) c = glm::mix(glm::vec3(0.15f, 0.80f, 0.20f), glm::vec3(0.95f, 0.85f, 0.10f), (t - 0.5f) / 0.25f);
-        else c = glm::mix(glm::vec3(0.95f, 0.85f, 0.10f), glm::vec3(0.90f, 0.15f, 0.10f), (t - 0.75f) / 0.25f);
-        return IM_COL32(static_cast<int>(c.r * 255), static_cast<int>(c.g * 255), static_cast<int>(c.b * 255), static_cast<int>(alpha * 255));
-    }
-
     // True if the terrain surface blocks the straight line from the camera to P. Marches at a
     // fixed world-space resolution (rather than a fixed step count) so that even distant points
     // are sampled finely enough that the ray can't skip clean over a ridge -- the coarse
@@ -1814,51 +1801,6 @@ private:
     // coordinates to grid cells; A*B is the node grid. Terrain occlusion and solid
     // cells fade the corner alpha so the plane is cut away cleanly behind mountains.
     template <class CellFn>
-    void drawSlicePlane(ImDrawList* dl, const glm::mat4& viewProj, WeatherField field,
-                        float lo, float hi, int A, int B, CellFn cellAt)
-    {
-        if (A < 2 || B < 2) return;
-        float range = std::max(1e-4f, hi - lo);
-        std::vector<ImVec2> pos(static_cast<std::size_t>(A) * B);
-        std::vector<ImU32> col(static_cast<std::size_t>(A) * B);
-        std::vector<std::uint8_t> ok(static_cast<std::size_t>(A) * B, 0);
-        for (int b = 0; b < B; ++b) {
-            for (int a = 0; a < A; ++a) {
-                int i, j, k; cellAt(a, b, i, j, k);
-                std::size_t n = static_cast<std::size_t>(b) * A + a;
-                glm::vec3 c = weather_.cellCenter(i, j, k);
-                ImVec2 sc; float depth;
-                if (!projectVolume(c, viewProj, sc, depth)) { ok[n] = 0; continue; }
-                float alpha = 0.60f;
-                if (weather_.isSolid(i, j, k) || occludedByTerrain(c)) alpha = 0.0f;
-                float t = (weather_.sample(field, i, j, k, weatherParams_) - lo) / range;
-                pos[n] = sc;
-                col[n] = colormap(t, alpha);
-                ok[n] = 1;
-            }
-        }
-        ImVec2 uv = ImGui::GetIO().Fonts->TexUvWhitePixel;
-        for (int b = 0; b < B - 1; ++b) {
-            for (int a = 0; a < A - 1; ++a) {
-                std::size_t n00 = static_cast<std::size_t>(b) * A + a;
-                std::size_t n10 = n00 + 1;
-                std::size_t n01 = n00 + A;
-                std::size_t n11 = n01 + 1;
-                if (!(ok[n00] && ok[n10] && ok[n01] && ok[n11])) continue;
-                if (((col[n00] | col[n10] | col[n01] | col[n11]) & IM_COL32_A_MASK) == 0) continue;
-                dl->PrimReserve(6, 4);
-                unsigned int base = dl->_VtxCurrentIdx;
-                dl->PrimWriteVtx(pos[n00], uv, col[n00]);
-                dl->PrimWriteVtx(pos[n10], uv, col[n10]);
-                dl->PrimWriteVtx(pos[n11], uv, col[n11]);
-                dl->PrimWriteVtx(pos[n01], uv, col[n01]);
-                dl->PrimWriteIdx((ImDrawIdx)(base + 0)); dl->PrimWriteIdx((ImDrawIdx)(base + 1)); dl->PrimWriteIdx((ImDrawIdx)(base + 2));
-                dl->PrimWriteIdx((ImDrawIdx)(base + 0)); dl->PrimWriteIdx((ImDrawIdx)(base + 2)); dl->PrimWriteIdx((ImDrawIdx)(base + 3));
-            }
-        }
-    }
-
-    template <class CellFn>
     void drawWindStreaksOnPlane(ImDrawList* dl, const glm::mat4& viewProj, int A, int B, int stride,
                                 CellFn cellAt)
     {
@@ -1885,25 +1827,6 @@ private:
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
         int nx = weather_.nx(), ny = weather_.ny(), nz = weather_.nz();
         WeatherField field = static_cast<WeatherField>(weatherField_);
-
-        // --- slice planes (continuous, gouraud) ---
-        if (showSliceH_ || showSliceV_) {
-            float lo, hi; stableColorRange(field, lo, hi);
-            if (showSliceH_) {
-                int j = glm::clamp(sliceH_, 0, ny - 1);
-                drawSlicePlane(dl, viewProj, field, lo, hi, nx, nz,
-                               [&](int a, int b, int& i, int& jj, int& k) { i = a; jj = j; k = b; });
-            }
-            if (showSliceV_) {
-                int s = glm::clamp(sliceV_, 0, vertAxisCount() - 1);
-                if (vertAxis_ == 0)
-                    drawSlicePlane(dl, viewProj, field, lo, hi, ny, nz,
-                                   [&](int a, int b, int& i, int& jj, int& k) { i = s; jj = a; k = b; });
-                else
-                    drawSlicePlane(dl, viewProj, field, lo, hi, nx, ny,
-                                   [&](int a, int b, int& i, int& jj, int& k) { i = a; jj = b; k = s; });
-            }
-        }
 
         // --- legacy billboard splat clouds (used only when the GPU ray-march is off) ---
         if (showClouds_ && !cloudVolumetric_) {
@@ -2005,6 +1928,13 @@ private:
         vkCmdBindIndexBuffer(commandBuffer, indexBuffer_, 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
         vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(terrain_.indices().size()), 1, 0, 0, 0);
+        if (sliceVertexCount_[currentFrame_] > 0) {
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, slicePipeline_);
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
+            VkDeviceSize sOff = 0;
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, &sliceVertexBuffers_[currentFrame_], &sOff);
+            vkCmdDraw(commandBuffer, sliceVertexCount_[currentFrame_], 1, 0, 0);
+        }
         // Volumetric clouds: fullscreen ray-march after terrain (reads terrain heightmap for
         // occlusion), before the ImGui overlay. Premultiplied-alpha blended over the scene.
         if (cloudVolumetric_ && showClouds_ && weather_.ready()) {
@@ -2033,6 +1963,7 @@ private:
         if (terrainDirty_) { uploadTerrain(); syncWeatherTerrain(); uploadCloudHeightmap(); }
         updateUniformBuffer(static_cast<std::uint32_t>(currentFrame_));
         updateCloudData(static_cast<std::uint32_t>(currentFrame_));
+        buildSliceGeometry(static_cast<std::uint32_t>(currentFrame_));
         vkResetCommandBuffer(commandBuffers_[currentFrame_], 0);
         recordCommandBuffer(commandBuffers_[currentFrame_], imageIndex);
         VkSemaphore waitSemaphores[] = {imageAvailable_[currentFrame_]};
@@ -2117,6 +2048,11 @@ private:
         vkDestroyImage(device_, skyboxImage_, nullptr);
         vkFreeMemory(device_, skyboxMemory_, nullptr);
         cleanupSwapchain();
+        vkDestroyPipeline(device_, slicePipeline_, nullptr);
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            if (sliceVertexBuffers_[i]) vkDestroyBuffer(device_, sliceVertexBuffers_[i], nullptr);
+            if (sliceVertexMemories_[i]) vkFreeMemory(device_, sliceVertexMemories_[i], nullptr);
+        }
         vkDestroyPipeline(device_, cloudPipeline_, nullptr);
         vkDestroyPipeline(device_, skyPipeline_, nullptr);
         vkDestroyPipeline(device_, pipeline_, nullptr);
