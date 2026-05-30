@@ -47,8 +47,8 @@ struct WeatherParams {
     float accretion = 2.2f;       // 1/s collision-coalescence: rain sweeps up cloud droplets
     float rainEvap = 0.25f;       // rain evaporation scale in subsaturated air
     float buoyancy = 1.0f;        // buoyancy multiplier
-    float lightningRate = 0.45f;  // stochastic flash frequency once storm charge builds
-    float lightningThreshold = 0.34f; // required cloud/rain/updraft charge before flashes fire
+    float lightningRate = 0.22f;  // stochastic flash frequency once storm charge builds
+    float lightningThreshold = 0.70f; // accumulated charge required before flashes fire
     int pressureIters = 24;       // Jacobi pressure iterations
     float timeScale = 45.0f;      // sim seconds per real second
     float vScale = 18.0f;         // atmosphere-depth scale: physical altitude = renderHeight * vScale
@@ -102,6 +102,8 @@ public:
         precipRate_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
         precipAccum_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
         lightning_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
+        stormCharge_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
+        lightningCooldown_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
         // Render thread only reads the latest finished snapshot, so keep a tiny ring
         // (a couple of frames of slack so a snapshot is never freed while being read).
         maxHistory_ = 3;
@@ -153,7 +155,10 @@ public:
         std::fill(precipRate_.begin(), precipRate_.end(), 0.0f);
         std::fill(precipAccum_.begin(), precipAccum_.end(), 0.0f);
         std::fill(lightning_.begin(), lightning_.end(), 0.0f);
+        std::fill(stormCharge_.begin(), stormCharge_.end(), 0.0f);
+        std::fill(lightningCooldown_.begin(), lightningCooldown_.end(), 0.0f);
         lightningFlash_ = 0.0f;
+        globalLightningCooldown_ = 0.0f;
         lightningTick_ = 0;
         simTime_ = 0.0f;
         auto snap = makeSnapshot();
@@ -309,8 +314,9 @@ private:
     std::vector<float> colHeight_;
     std::vector<int> surfaceJ_;
     std::vector<float> precipRate_, precipAccum_;
-    std::vector<float> lightning_;
+    std::vector<float> lightning_, stormCharge_, lightningCooldown_;
     float lightningFlash_ = 0.0f;
+    float globalLightningCooldown_ = 0.0f;
     int lightningTick_ = 0;
 
     // Rolling history for the timeline scrubber. Snapshots are immutable once published, so
@@ -959,6 +965,7 @@ private:
                 float denom = 1.0f + (kL * kL * qs) / (kCp * 461.0f * T * T);
                 float cond = (qv_[c] - qs) / denom;
                 cond = std::min(cond, qv_[c]);
+                cond *= glm::clamp(1.0f - std::exp(-dt / 6.0f), 0.0f, 0.45f);
                 qv_[c] -= cond; qc_[c] += cond;
                 theta_[c] += (kL / kCp) * cond / ex;
             } else if (qc_[c] > 0.0f) {
@@ -985,6 +992,13 @@ private:
                 evap = std::min(evap, qr_[c]);
                 qr_[c] -= evap; qv_[c] += evap;
                 theta_[c] -= (kL / kCp) * evap / ex; // evaporative cooling -> downdrafts
+            }
+            if (qc_[c] > 0.0f) {
+                float mixing = (0.0025f + p.turbulence * 0.006f) * dt * qc_[c];
+                mixing = std::min(mixing, qc_[c]);
+                qc_[c] -= mixing;
+                qv_[c] += mixing;
+                theta_[c] -= (kL / kCp) * mixing / ex;
             }
             qv_[c] = std::max(qv_[c], 0.0f);
             qc_[c] = std::max(qc_[c], 0.0f);
@@ -1013,39 +1027,80 @@ private:
     void updateLightning(float dt, const WeatherParams& p)
     {
         ++lightningTick_;
-        float columnDecay = std::exp(-dt * 1.65f);
-        float flashDecay = std::exp(-dt * 2.4f);
-        lightningFlash_ *= flashDecay;
+        float strikeDecay = std::exp(-dt * 1.85f);
+        lightningFlash_ *= std::exp(-dt * 2.4f);
+        globalLightningCooldown_ = std::max(0.0f, globalLightningCooldown_ - dt);
         if (p.lightningRate <= 0.0f) {
-            for (float& v : lightning_) v *= columnDecay;
+            for (std::size_t n = 0; n < lightning_.size(); ++n) {
+                lightning_[n] *= strikeDecay;
+                stormCharge_[n] *= std::exp(-dt * 0.08f);
+                lightningCooldown_[n] = std::max(0.0f, lightningCooldown_[n] - dt);
+            }
             return;
         }
 
         for (int k = 0; k < nz_; ++k) {
             for (int i = 0; i < nx_; ++i) {
                 int col = k * nx_ + i;
-                lightning_[col] *= columnDecay;
-                float charge = 0.0f;
+                lightning_[col] *= strikeDecay;
+                lightningCooldown_[col] = std::max(0.0f, lightningCooldown_[col] - dt);
+
                 int baseJ = glm::clamp(surfaceJ_[col] + 1, 0, ny_ - 1);
+                int firstCloud = ny_, lastCloud = -1;
+                float cloudMass = 0.0f;
+                float rainMass = 0.0f;
+                float maxUpdraft = 0.0f;
                 for (int j = baseJ; j < ny_; ++j) {
                     int c = idx(i, j, k);
                     if (solid_[c]) continue;
                     float cloud = qc_[c] * 1000.0f; // g/kg-ish display scale
                     float rain = qr_[c] * 1000.0f;
-                    if (cloud < 0.015f && rain < 0.008f) continue;
-                    float heightFrac = static_cast<float>(j - baseJ + 1) / static_cast<float>(std::max(1, ny_ - baseJ));
-                    float updraft = std::max(v_[c], 0.0f);
-                    float localCharge = (cloud * 0.55f + rain * 1.65f) * (0.28f + updraft) * heightFrac;
-                    charge = std::max(charge, localCharge);
+                    if (cloud > 0.025f) {
+                        firstCloud = std::min(firstCloud, j);
+                        lastCloud = std::max(lastCloud, j);
+                    }
+                    cloudMass += cloud;
+                    rainMass += rain;
+                    maxUpdraft = std::max(maxUpdraft, v_[c]);
                 }
 
-                float excess = charge - p.lightningThreshold;
-                if (excess <= 0.0f) continue;
-                float chance = glm::clamp(excess * p.lightningRate * dt * 0.55f, 0.0f, 0.65f);
+                int activeDepth = lastCloud >= firstCloud ? lastCloud - firstCloud + 1 : 0;
+                float availableDepth = static_cast<float>(std::max(1, ny_ - baseJ));
+                float depthFrac = static_cast<float>(activeDepth) / availableDepth;
+                float topFrac = lastCloud >= 0 ? static_cast<float>(lastCloud - baseJ + 1) / availableDepth : 0.0f;
+                bool deepCore = activeDepth >= std::max(4, ny_ / 7) && topFrac > 0.44f;
+                bool convective = deepCore && maxUpdraft > 0.08f && (cloudMass > 0.18f || rainMass > 0.04f);
+
+                if (convective) {
+                    float source = (cloudMass * 0.18f + rainMass * 0.62f)
+                                 * (0.18f + maxUpdraft * 0.70f)
+                                 * glm::clamp(depthFrac * 2.2f, 0.0f, 1.0f);
+                    stormCharge_[col] += source * dt * 0.20f;
+                }
+                stormCharge_[col] *= std::exp(-dt * (convective ? 0.018f : 0.09f));
+                stormCharge_[col] = glm::clamp(stormCharge_[col], 0.0f, 3.0f);
+
+                float excess = stormCharge_[col] - p.lightningThreshold;
+                if (excess <= 0.0f || lightningCooldown_[col] > 0.0f || globalLightningCooldown_ > 0.0f) continue;
+                float chance = glm::clamp(excess * p.lightningRate * dt * 0.22f, 0.0f, 0.22f);
                 float r = 0.5f + 0.5f * hashNoise(i + lightningTick_ * 17, lightningTick_ * 31, k - lightningTick_ * 13);
                 if (r < chance) {
                     float flash = glm::clamp(0.45f + excess * 0.85f, 0.0f, 1.0f);
                     lightning_[col] = std::max(lightning_[col], flash);
+                    stormCharge_[col] *= 0.18f;
+                    globalLightningCooldown_ = std::max(globalLightningCooldown_, 1.6f + 1.4f * flash);
+                    for (int dk = -3; dk <= 3; ++dk) {
+                        for (int di = -3; di <= 3; ++di) {
+                            int ni = i + di, nk = k + dk;
+                            if (ni < 0 || ni >= nx_ || nk < 0 || nk >= nz_) continue;
+                            float d = std::sqrt(static_cast<float>(di * di + dk * dk));
+                            if (d > 3.25f) continue;
+                            int ncol = nk * nx_ + ni;
+                            float falloff = 1.0f - d / 3.25f;
+                            lightningCooldown_[ncol] = std::max(lightningCooldown_[ncol], 5.5f * falloff);
+                            stormCharge_[ncol] *= (1.0f - 0.35f * falloff);
+                        }
+                    }
                     lightningFlash_ = std::max(lightningFlash_, flash);
                 }
             }

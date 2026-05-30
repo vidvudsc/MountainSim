@@ -1743,8 +1743,8 @@ private:
                 p.turbulence = 0.06f;
                 p.terrainFlow = 0.35f;
                 p.autoThresh = 0.0025f;
-                p.lightningRate = 0.02f;
-                p.lightningThreshold = 0.95f;
+                p.lightningRate = 0.0f;
+                p.lightningThreshold = 1.25f;
                 p.timeScale = 55.0f;
                 break;
             case 2: // Orographic cloud
@@ -1764,8 +1764,8 @@ private:
                 p.autoThresh = 0.00035f;
                 p.accretion = 1.8f;
                 p.rainEvap = 0.35f;
-                p.lightningRate = 0.18f;
-                p.lightningThreshold = 0.52f;
+                p.lightningRate = 0.05f;
+                p.lightningThreshold = 1.05f;
                 p.timeScale = 45.0f;
                 break;
             case 3: // Storm buildup
@@ -1786,8 +1786,8 @@ private:
                 p.accretion = 3.6f;
                 p.rainEvap = 0.18f;
                 p.buoyancy = 1.45f;
-                p.lightningRate = 1.10f;
-                p.lightningThreshold = 0.24f;
+                p.lightningRate = 0.55f;
+                p.lightningThreshold = 0.58f;
                 p.timeScale = 34.0f;
                 break;
             case 4: // Rain shadow
@@ -1807,8 +1807,8 @@ private:
                 p.autoThresh = 0.00045f;
                 p.accretion = 2.8f;
                 p.rainEvap = 0.42f;
-                p.lightningRate = 0.42f;
-                p.lightningThreshold = 0.38f;
+                p.lightningRate = 0.16f;
+                p.lightningThreshold = 0.82f;
                 p.timeScale = 50.0f;
                 break;
             case 5: // Valley fog
@@ -1878,8 +1878,8 @@ private:
         ImGui::SliderFloat("Accretion", &weatherParams_.accretion, 0.0f, 8.0f, "%.1f");
         ImGui::SliderFloat("Rain evap", &weatherParams_.rainEvap, 0.0f, 1.0f, "%.2f");
         ImGui::SliderFloat("Buoyancy", &weatherParams_.buoyancy, 0.0f, 2.5f, "%.2f");
-        ImGui::SliderFloat("Lightning rate", &weatherParams_.lightningRate, 0.0f, 2.0f, "%.2f");
-        ImGui::SliderFloat("Lightning threshold", &weatherParams_.lightningThreshold, 0.05f, 1.2f, "%.2f");
+        ImGui::SliderFloat("Lightning rate", &weatherParams_.lightningRate, 0.0f, 1.4f, "%.2f");
+        ImGui::SliderFloat("Lightning threshold", &weatherParams_.lightningThreshold, 0.25f, 1.8f, "%.2f");
 
         ImGui::SeparatorText("Solver");
         ImGui::SliderInt("Pressure iters", &weatherParams_.pressureIters, 6, 60);
@@ -2050,13 +2050,6 @@ private:
 
         // --- lightning: short-lived storm-column discharge, sourced by the solver ---
         if (showLightning_) {
-            float flash = weather_.lightningFlash();
-            if (flash > 0.02f) {
-                ImVec2 ds = ImGui::GetIO().DisplaySize;
-                int alpha = static_cast<int>(glm::clamp(flash * 26.0f, 0.0f, 34.0f));
-                dl->AddRectFilled(ImVec2(0.0f, 0.0f), ds, IM_COL32(180, 205, 255, alpha));
-            }
-
             float dxz = kTerrainWorldSize / static_cast<float>(std::max(1, nx));
             int drawn = 0;
             for (int k = 0; k < nz && drawn < 80; ++k) {
