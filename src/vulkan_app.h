@@ -143,6 +143,13 @@ private:
     std::array<void*, kMaxFramesInFlight> sliceVertexMapped_{};
     std::array<std::uint32_t, kMaxFramesInFlight> sliceVertexCount_{};
 
+    // --- day/night clock (drives the sun for both rendering and the weather solver) ---
+    bool clockAuto_ = true;         // auto-advance vs. manual scrub
+    float timeOfDay_ = 9.0f;        // hours, 0..24
+    float dayLengthSec_ = 90.0f;    // real seconds per simulated day
+    float season_ = 0.4f;           // -1 = winter, +1 = summer (solar declination scale)
+    float latitudeDeg_ = 45.0f;
+
     void initWindow()
     {
         if (!glfwInit()) throw std::runtime_error("Failed to initialize GLFW");
@@ -1465,11 +1472,36 @@ private:
         }
     }
 
+    // Sun direction from the day/night clock: a real solar arc from time-of-day, season
+    // (declination) and latitude. Elevation goes negative at night, which shuts off solar
+    // heating in the solver and darkens the sky in the renderer.
     glm::vec3 sunDirection() const
     {
-        float azimuth = glm::radians(terrain_.settings().sunAzimuth);
-        float elevation = glm::radians(terrain_.settings().sunElevation);
-        return glm::normalize(glm::vec3(std::cos(elevation) * std::cos(azimuth), std::sin(elevation), std::cos(elevation) * std::sin(azimuth)));
+        float hourAngle = glm::radians((timeOfDay_ - 12.0f) * 15.0f); // 0 at solar noon
+        float decl = glm::radians(23.44f * season_);
+        float lat = glm::radians(latitudeDeg_);
+        float sinElev = std::sin(lat) * std::sin(decl) + std::cos(lat) * std::cos(decl) * std::cos(hourAngle);
+        sinElev = glm::clamp(sinElev, -1.0f, 1.0f);
+        float elev = std::asin(sinElev);
+        float cosElev = std::cos(elev);
+        // Azimuth measured from north; flip after noon so the sun travels east -> west.
+        float cosAz = (cosElev > 1e-4f) ? (std::sin(decl) - std::sin(lat) * sinElev) / (std::cos(lat) * cosElev) : 0.0f;
+        float az = std::acos(glm::clamp(cosAz, -1.0f, 1.0f));
+        if (hourAngle > 0.0f) az = 2.0f * 3.14159265f - az;
+        // World vector: x east, y up, z north-ish. Exact compass alignment isn't critical;
+        // what matters is a smooth arc that dips below the horizon at night.
+        return glm::normalize(glm::vec3(cosElev * std::sin(az), sinElev, -cosElev * std::cos(az)));
+    }
+
+    // Advance the clock by real elapsed time (wraps at 24 h). Dragging the slider overrides
+    // the value directly, and auto-advance simply continues from wherever it was set.
+    void advanceClock(float dtReal)
+    {
+        if (clockAuto_ && dayLengthSec_ > 0.1f) {
+            timeOfDay_ += dtReal / dayLengthSec_ * 24.0f;
+            timeOfDay_ = std::fmod(timeOfDay_, 24.0f);
+            if (timeOfDay_ < 0.0f) timeOfDay_ += 24.0f;
+        }
     }
 
     void updateUniformBuffer(std::uint32_t frame)
@@ -1574,9 +1606,18 @@ private:
         ImGui::Checkbox("Show water", &terrain_.settings().showWater);
         ImGui::Checkbox("Show sediment", &terrain_.settings().showSediment);
         ImGui::SliderFloat("Fog density", &terrain_.settings().fogDensity, 0.0f, 0.03f, "%.3f");
-        ImGui::SliderFloat("Sun azimuth", &terrain_.settings().sunAzimuth, -180.0f, 180.0f, "%.0f deg");
-        ImGui::SliderFloat("Sun elevation", &terrain_.settings().sunElevation, 2.0f, 88.0f, "%.0f deg");
         ImGui::Checkbox("Wireframe", &wireframe_);
+
+        ImGui::SeparatorText("Time of day & sky");
+        ImGui::Checkbox("Auto-advance", &clockAuto_);
+        ImGui::SliderFloat("Time of day", &timeOfDay_, 0.0f, 24.0f, "%.2f h");
+        int hh = static_cast<int>(timeOfDay_);
+        int mm = static_cast<int>((timeOfDay_ - hh) * 60.0f) % 60;
+        float elevDeg = glm::degrees(std::asin(glm::clamp(sunDirection().y, -1.0f, 1.0f)));
+        ImGui::Text("%02d:%02d   sun %+.0f deg %s", hh, mm, elevDeg, elevDeg > 0.0f ? "(day)" : "(night)");
+        ImGui::SliderFloat("Day length", &dayLengthSec_, 15.0f, 600.0f, "%.0f s/day");
+        ImGui::SliderFloat("Season", &season_, -1.0f, 1.0f, "%.2f (-1 winter / +1 summer)");
+        ImGui::SliderFloat("Latitude", &latitudeDeg_, 0.0f, 66.0f, "%.0f deg");
         ImGui::End();
 
         ImGui::SetNextWindowPos(ImVec2(365, 306), ImGuiCond_FirstUseEver);
@@ -1672,11 +1713,12 @@ private:
         return false;
     }
 
-    void updateWeather(float)
+    void updateWeather(float dt)
     {
+        advanceClock(dt);
         if (!weather_.ready()) return;
-        // The solver runs on its own thread; we only hand it inputs and always display
-        // the latest finished snapshot.
+        // The solver runs on its own thread; we only hand it inputs (including the live sun
+        // from the clock) and always display the latest finished snapshot.
         weather_.setControls(weatherRunning_, weatherParams_, sunDirection());
         weather_.setViewFrame(-1);
     }
