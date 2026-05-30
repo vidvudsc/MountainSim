@@ -40,6 +40,7 @@ struct WeatherParams {
                                   // so thermally-driven circulations aren't damped back flat)
     float gustStrength = 0.16f;   // low-frequency evolving inflow variation
     float turbulence = 0.10f;     // small continual eddy forcing, m/s^2-ish
+    float terrainFlow = 0.55f;    // thermal upslope / nocturnal downslope wind coupling
     float rainFall = 6.0f;        // m/s rain terminal velocity
     float autoconv = 0.0016f;     // 1/s cloud -> rain conversion
     float autoThresh = 0.0001f;   // kg/kg cloud water threshold for autoconversion (0.1 g/kg)
@@ -879,6 +880,24 @@ private:
             // surface friction
             float drag = std::min(1.0f, p.surfaceDrag * dt);
             u_[c] *= (1.0f - drag); w_[c] *= (1.0f - drag);
+            glm::vec2 slope(hx, hz);
+            float slopeMag = glm::length(slope);
+            if (p.terrainFlow > 0.0f && slopeMag > 1e-4f) {
+                glm::vec2 uphill = slope / slopeMag;
+                float thermal = daytime ? glm::clamp(solar / std::max(p.solarHeating, 1e-5f), 0.0f, 1.0f)
+                                        : -glm::clamp(ir / std::max(p.irCooling, 1e-5f), 0.0f, 1.0f);
+                glm::vec2 dir = uphill * thermal;
+                float force = p.terrainFlow * glm::clamp(slopeMag, 0.0f, 1.8f) * dt;
+                u_[c] += dir.x * force;
+                w_[c] += dir.y * force;
+                if (j + 1 < ny_) {
+                    int above = idx(i, j + 1, k);
+                    if (!solid_[above]) {
+                        u_[above] += dir.x * force * 0.42f;
+                        w_[above] += dir.y * force * 0.42f;
+                    }
+                }
+            }
         });
     }
 

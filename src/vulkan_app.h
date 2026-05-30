@@ -1740,6 +1740,7 @@ private:
                 p.windNudge = 0.18f;
                 p.gustStrength = 0.10f;
                 p.turbulence = 0.06f;
+                p.terrainFlow = 0.35f;
                 p.autoThresh = 0.0025f;
                 p.timeScale = 55.0f;
                 break;
@@ -1755,6 +1756,7 @@ private:
                 p.windNudge = 0.12f;
                 p.gustStrength = 0.14f;
                 p.turbulence = 0.10f;
+                p.terrainFlow = 0.62f;
                 p.autoconv = 0.0012f;
                 p.autoThresh = 0.00035f;
                 p.accretion = 1.8f;
@@ -1773,6 +1775,7 @@ private:
                 p.windNudge = 0.07f;
                 p.gustStrength = 0.26f;
                 p.turbulence = 0.22f;
+                p.terrainFlow = 0.72f;
                 p.autoconv = 0.0024f;
                 p.autoThresh = 0.00025f;
                 p.accretion = 3.6f;
@@ -1792,6 +1795,7 @@ private:
                 p.windNudge = 0.22f;
                 p.gustStrength = 0.18f;
                 p.turbulence = 0.08f;
+                p.terrainFlow = 0.48f;
                 p.autoconv = 0.0017f;
                 p.autoThresh = 0.00045f;
                 p.accretion = 2.8f;
@@ -1810,6 +1814,7 @@ private:
                 p.windNudge = 0.03f;
                 p.gustStrength = 0.05f;
                 p.turbulence = 0.04f;
+                p.terrainFlow = 0.88f;
                 p.autoconv = 0.0007f;
                 p.autoThresh = 0.0009f;
                 p.accretion = 0.8f;
@@ -1853,6 +1858,7 @@ private:
         ImGui::SliderFloat("Wind nudge", &weatherParams_.windNudge, 0.0f, 1.0f, "%.2f");
         ImGui::SliderFloat("Gusts", &weatherParams_.gustStrength, 0.0f, 0.6f, "%.2f");
         ImGui::SliderFloat("Turbulence", &weatherParams_.turbulence, 0.0f, 0.7f, "%.2f");
+        ImGui::SliderFloat("Terrain flow", &weatherParams_.terrainFlow, 0.0f, 1.5f, "%.2f");
 
         ImGui::SeparatorText("Moisture");
         ImGui::SliderFloat("Rain fall speed", &weatherParams_.rainFall, 1.0f, 12.0f, "%.1f m/s");
