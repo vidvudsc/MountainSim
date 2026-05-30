@@ -30,6 +30,13 @@ struct SceneUniforms {
     glm::vec4 fogColor{};
     glm::vec4 terrain{};
     glm::vec4 effects{};
+    // Appended for the volumetric cloud pass (existing shaders ignore these trailing
+    // members; their offsets are unchanged because they come after the originals).
+    glm::mat4 invViewProj{1.0f}; // world ray reconstruction from screen
+    glm::vec4 volMin{};          // xyz: world position of cloud cell-center (0,0,0)
+    glm::vec4 volMax{};          // xyz: world position of cell-center (nx-1,ny-1,nz-1)
+    glm::vec4 cloudGrid{};       // x,y,z = grid dims; w = heightmap resolution
+    glm::vec4 cloudParams{};     // x density, y steps, z sun absorption, w coverage bias
 };
 
 inline std::vector<char> readBinaryFile(const std::string& path)

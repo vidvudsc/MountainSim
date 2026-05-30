@@ -113,6 +113,26 @@ private:
     float fieldHi_[9] = {0};
     bool fieldRangeInit_[9] = {false};
 
+    // --- volumetric clouds (GPU ray-march) ---
+    bool cloudVolumetric_ = true;       // true: ray-march; false: legacy billboard splats
+    float cloudDensity_ = 1500.0f;      // extinction per unit qc
+    int cloudSteps_ = 48;               // primary march samples
+    float cloudSunAbsorb_ = 1.0f;       // self-shadow strength
+    float cloudCoverage_ = 0.0f;        // density floor (trims wisps)
+    static constexpr int kCloudHeightRes = 192;                 // occlusion heightmap resolution
+    static constexpr int kCloudMaxCells = 144 * 96 * 144;       // SSBO capacity (grid slider maxima)
+    VkDescriptorSetLayout cloudSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout cloudPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline cloudPipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool cloudPool_ = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, kMaxFramesInFlight> cloudSets_{};
+    std::array<VkBuffer, kMaxFramesInFlight> cloudFieldBuffers_{};
+    std::array<VkDeviceMemory, kMaxFramesInFlight> cloudFieldMemories_{};
+    std::array<void*, kMaxFramesInFlight> cloudFieldMapped_{};
+    VkBuffer cloudHeightBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory cloudHeightMemory_ = VK_NULL_HANDLE;
+    void* cloudHeightMapped_ = nullptr;
+
     void initWindow()
     {
         if (!glfwInit()) throw std::runtime_error("Failed to initialize GLFW");
@@ -140,18 +160,23 @@ private:
         createSwapchain();
         createRenderPass();
         createDescriptorSetLayout();
+        createCloudDescriptorSetLayout();
         createPipeline();
+        createCloudPipeline();
         createDepthResources();
         createFramebuffers();
         createCommandPool();
         createSkyboxResources();
         createTerrainBuffers();
         createUniformBuffers();
+        createCloudResources();
         createDescriptorPool();
         createDescriptorSets();
+        createCloudDescriptors();
         createCommandBuffers();
         createSyncObjects();
         initWeather();
+        uploadCloudHeightmap();
     }
 
     void initWeather()
@@ -597,6 +622,190 @@ private:
         checkVk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &skyPipeline_), "Failed to create sky pipeline");
         vkDestroyShaderModule(device_, vert, nullptr);
         vkDestroyShaderModule(device_, frag, nullptr);
+    }
+
+    // ---- volumetric cloud pass --------------------------------------------------------------
+    void createCloudDescriptorSetLayout()
+    {
+        VkDescriptorSetLayoutBinding ubo{};
+        ubo.binding = 0;
+        ubo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        ubo.descriptorCount = 1;
+        ubo.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutBinding field{};
+        field.binding = 1;
+        field.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        field.descriptorCount = 1;
+        field.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutBinding height{};
+        height.binding = 2;
+        height.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        height.descriptorCount = 1;
+        height.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        std::array<VkDescriptorSetLayoutBinding, 3> bindings{ubo, field, height};
+        VkDescriptorSetLayoutCreateInfo createInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        createInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+        createInfo.pBindings = bindings.data();
+        checkVk(vkCreateDescriptorSetLayout(device_, &createInfo, nullptr, &cloudSetLayout_), "Failed to create cloud descriptor layout");
+    }
+
+    void createCloudPipeline()
+    {
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &cloudSetLayout_;
+        checkVk(vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &cloudPipelineLayout_), "Failed to create cloud pipeline layout");
+
+        VkShaderModule vert = createShaderModule(readBinaryFile(std::string(SHADER_BINARY_DIR) + "/cloud.vert.spv"));
+        VkShaderModule frag = createShaderModule(readBinaryFile(std::string(SHADER_BINARY_DIR) + "/cloud.frag.spv"));
+        VkPipelineShaderStageCreateInfo vertStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+        vertStage.module = vert;
+        vertStage.pName = "main";
+        VkPipelineShaderStageCreateInfo fragStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        fragStage.module = frag;
+        fragStage.pName = "main";
+        std::array<VkPipelineShaderStageCreateInfo, 2> stages{vertStage, fragStage};
+
+        VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.polygonMode = VK_POLYGON_MODE_FILL;
+        raster.cullMode = VK_CULL_MODE_NONE;
+        raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        raster.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        depth.depthTestEnable = VK_FALSE;
+        depth.depthWriteEnable = VK_FALSE;
+        // Premultiplied-alpha "over": out = src.rgb + dst.rgb * (1 - src.a).
+        VkPipelineColorBlendAttachmentState blendAttachment{};
+        blendAttachment.blendEnable = VK_TRUE;
+        blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+        blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+        blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        blend.attachmentCount = 1;
+        blend.pAttachments = &blendAttachment;
+        std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
+        dynamic.pDynamicStates = dynamicStates.data();
+        VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
+        pipelineInfo.pStages = stages.data();
+        pipelineInfo.pVertexInputState = &vertexInput;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &raster;
+        pipelineInfo.pMultisampleState = &multisample;
+        pipelineInfo.pDepthStencilState = &depth;
+        pipelineInfo.pColorBlendState = &blend;
+        pipelineInfo.pDynamicState = &dynamic;
+        pipelineInfo.layout = cloudPipelineLayout_;
+        pipelineInfo.renderPass = renderPass_;
+        pipelineInfo.subpass = 0;
+        checkVk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &cloudPipeline_), "Failed to create cloud pipeline");
+        vkDestroyShaderModule(device_, vert, nullptr);
+        vkDestroyShaderModule(device_, frag, nullptr);
+    }
+
+    void createCloudResources()
+    {
+        VkDeviceSize fieldBytes = static_cast<VkDeviceSize>(kCloudMaxCells) * sizeof(float);
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            createBuffer(fieldBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         cloudFieldBuffers_[i], cloudFieldMemories_[i]);
+            vkMapMemory(device_, cloudFieldMemories_[i], 0, fieldBytes, 0, &cloudFieldMapped_[i]);
+            std::memset(cloudFieldMapped_[i], 0, fieldBytes);
+        }
+        VkDeviceSize hgtBytes = static_cast<VkDeviceSize>(kCloudHeightRes) * kCloudHeightRes * sizeof(float);
+        createBuffer(hgtBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     cloudHeightBuffer_, cloudHeightMemory_);
+        vkMapMemory(device_, cloudHeightMemory_, 0, hgtBytes, 0, &cloudHeightMapped_);
+        std::memset(cloudHeightMapped_, 0, hgtBytes);
+    }
+
+    void createCloudDescriptors()
+    {
+        std::array<VkDescriptorPoolSize, 2> poolSizes{{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kMaxFramesInFlight},
+        }};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
+        poolInfo.maxSets = kMaxFramesInFlight;
+        checkVk(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &cloudPool_), "Failed to create cloud descriptor pool");
+
+        std::array<VkDescriptorSetLayout, kMaxFramesInFlight> layouts{};
+        layouts.fill(cloudSetLayout_);
+        VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        alloc.descriptorPool = cloudPool_;
+        alloc.descriptorSetCount = kMaxFramesInFlight;
+        alloc.pSetLayouts = layouts.data();
+        checkVk(vkAllocateDescriptorSets(device_, &alloc, cloudSets_.data()), "Failed to allocate cloud descriptor sets");
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            VkDescriptorBufferInfo uboInfo{uniformBuffers_[i], 0, sizeof(SceneUniforms)};
+            VkDescriptorBufferInfo fieldInfo{cloudFieldBuffers_[i], 0, VK_WHOLE_SIZE};
+            VkDescriptorBufferInfo hgtInfo{cloudHeightBuffer_, 0, VK_WHOLE_SIZE};
+            std::array<VkWriteDescriptorSet, 3> writes{};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet = cloudSets_[i];
+            writes[0].dstBinding = 0;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[0].descriptorCount = 1;
+            writes[0].pBufferInfo = &uboInfo;
+            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1].dstSet = cloudSets_[i];
+            writes[1].dstBinding = 1;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[1].descriptorCount = 1;
+            writes[1].pBufferInfo = &fieldInfo;
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet = cloudSets_[i];
+            writes[2].dstBinding = 2;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[2].descriptorCount = 1;
+            writes[2].pBufferInfo = &hgtInfo;
+            vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
+    }
+
+    // Rasterize the terrain surface height into the occlusion heightmap (world XZ grid).
+    void uploadCloudHeightmap()
+    {
+        if (!cloudHeightMapped_) return;
+        float* h = static_cast<float*>(cloudHeightMapped_);
+        const float WS = kTerrainWorldSize;
+        for (int z = 0; z < kCloudHeightRes; ++z) {
+            float wz = -WS * 0.5f + (z / static_cast<float>(kCloudHeightRes - 1)) * WS;
+            for (int x = 0; x < kCloudHeightRes; ++x) {
+                float wx = -WS * 0.5f + (x / static_cast<float>(kCloudHeightRes - 1)) * WS;
+                h[z * kCloudHeightRes + x] = terrain_.surfaceHeightAtWorld(wx, wz);
+            }
+        }
+    }
+
+    // Push the current cloud-water volume into this frame's storage buffer.
+    void updateCloudData(std::uint32_t frame)
+    {
+        if (!weather_.ready() || !cloudFieldMapped_[frame]) return;
+        int cells = weather_.nx() * weather_.ny() * weather_.nz();
+        if (cells <= 0 || cells > kCloudMaxCells) return;
+        weather_.copyCloudField(static_cast<float*>(cloudFieldMapped_[frame]));
     }
 
     std::uint32_t findMemoryType(std::uint32_t typeFilter, VkMemoryPropertyFlags properties)
@@ -1126,6 +1335,17 @@ private:
         ubo.fogColor = glm::vec4(fogColor, 1.0f);
         ubo.terrain = glm::vec4(s.heightScale, s.snowLevel, s.waterLevel, s.fogDensity);
         ubo.effects = glm::vec4(s.waterTint, s.sedimentTint, s.showWater ? 1.0f : 0.0f, s.showSediment ? 1.0f : 0.0f);
+        // Volumetric cloud parameters (world ray reconstruction + the box the field lives in).
+        ubo.invViewProj = glm::inverse(ubo.proj * ubo.view);
+        if (weather_.ready()) {
+            glm::vec3 lo = weather_.cellCenter(0, 0, 0);
+            glm::vec3 hi = weather_.cellCenter(weather_.nx() - 1, weather_.ny() - 1, weather_.nz() - 1);
+            ubo.volMin = glm::vec4(lo, 0.0f);
+            ubo.volMax = glm::vec4(hi, 0.0f);
+            ubo.cloudGrid = glm::vec4(static_cast<float>(weather_.nx()), static_cast<float>(weather_.ny()),
+                                      static_cast<float>(weather_.nz()), static_cast<float>(kCloudHeightRes));
+        }
+        ubo.cloudParams = glm::vec4(cloudDensity_, static_cast<float>(cloudSteps_), cloudSunAbsorb_, cloudCoverage_);
         void* data = nullptr;
         vkMapMemory(device_, uniformMemories_[frame], 0, sizeof(ubo), 0, &data);
         std::memcpy(data, &ubo, sizeof(ubo));
@@ -1376,6 +1596,15 @@ private:
         ImGui::Checkbox("Rain", &showRain_); ImGui::SameLine();
         ImGui::Checkbox("Wind", &showWindStreaks_);
 
+        ImGui::SeparatorText("Clouds");
+        ImGui::Checkbox("Volumetric (GPU ray-march)", &cloudVolumetric_);
+        if (cloudVolumetric_) {
+            ImGui::SliderFloat("Density", &cloudDensity_, 100.0f, 6000.0f, "%.0f");
+            ImGui::SliderInt("March steps", &cloudSteps_, 12, 128);
+            ImGui::SliderFloat("Sun absorption", &cloudSunAbsorb_, 0.1f, 4.0f, "%.2f");
+            ImGui::SliderFloat("Coverage trim", &cloudCoverage_, 0.0f, 0.5f, "%.3f");
+        }
+
         const char* fields[] = {"Temperature", "Theta pert", "Vertical wind", "Wind speed", "Vapor", "Rel humidity", "Cloud", "Rain", "Vorticity"};
         ImGui::Combo("Field", &weatherField_, fields, IM_ARRAYSIZE(fields));
 
@@ -1517,8 +1746,8 @@ private:
             }
         }
 
-        // --- volumetric clouds: depth-sorted soft billboards (back-to-front) ---
-        if (showClouds_) {
+        // --- legacy billboard splat clouds (used only when the GPU ray-march is off) ---
+        if (showClouds_ && !cloudVolumetric_) {
             float dxz = kTerrainWorldSize / static_cast<float>(nx);
             struct Puff { float depth; ImVec2 sc; float sz; float a; };
             static std::vector<Puff> puffs;
@@ -1617,6 +1846,13 @@ private:
         vkCmdBindIndexBuffer(commandBuffer, indexBuffer_, 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
         vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(terrain_.indices().size()), 1, 0, 0, 0);
+        // Volumetric clouds: fullscreen ray-march after terrain (reads terrain heightmap for
+        // occlusion), before the ImGui overlay. Premultiplied-alpha blended over the scene.
+        if (cloudVolumetric_ && showClouds_ && weather_.ready()) {
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, cloudPipeline_);
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, cloudPipelineLayout_, 0, 1, &cloudSets_[currentFrame_], 0, nullptr);
+            vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        }
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
         vkCmdEndRenderPass(commandBuffer);
         checkVk(vkEndCommandBuffer(commandBuffer), "Failed to record command buffer");
@@ -1635,8 +1871,9 @@ private:
             checkVk(acquire, "Failed to acquire swapchain image");
         }
         vkResetFences(device_, 1, &inFlight_[currentFrame_]);
-        if (terrainDirty_) { uploadTerrain(); syncWeatherTerrain(); }
+        if (terrainDirty_) { uploadTerrain(); syncWeatherTerrain(); uploadCloudHeightmap(); }
         updateUniformBuffer(static_cast<std::uint32_t>(currentFrame_));
+        updateCloudData(static_cast<std::uint32_t>(currentFrame_));
         vkResetCommandBuffer(commandBuffers_[currentFrame_], 0);
         recordCommandBuffer(commandBuffers_[currentFrame_], imageIndex);
         VkSemaphore waitSemaphores[] = {imageAvailable_[currentFrame_]};
@@ -1703,7 +1940,14 @@ private:
             vkDestroyBuffer(device_, uniformBuffers_[i], nullptr);
             vkFreeMemory(device_, uniformMemories_[i], nullptr);
         }
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            if (cloudFieldBuffers_[i]) vkDestroyBuffer(device_, cloudFieldBuffers_[i], nullptr);
+            if (cloudFieldMemories_[i]) vkFreeMemory(device_, cloudFieldMemories_[i], nullptr);
+        }
+        if (cloudHeightBuffer_) vkDestroyBuffer(device_, cloudHeightBuffer_, nullptr);
+        if (cloudHeightMemory_) vkFreeMemory(device_, cloudHeightMemory_, nullptr);
         vkDestroyDescriptorPool(device_, imguiPool_, nullptr);
+        vkDestroyDescriptorPool(device_, cloudPool_, nullptr);
         vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
         vkDestroyBuffer(device_, indexBuffer_, nullptr);
         vkFreeMemory(device_, indexMemory_, nullptr);
@@ -1714,9 +1958,12 @@ private:
         vkDestroyImage(device_, skyboxImage_, nullptr);
         vkFreeMemory(device_, skyboxMemory_, nullptr);
         cleanupSwapchain();
+        vkDestroyPipeline(device_, cloudPipeline_, nullptr);
         vkDestroyPipeline(device_, skyPipeline_, nullptr);
         vkDestroyPipeline(device_, pipeline_, nullptr);
+        vkDestroyPipelineLayout(device_, cloudPipelineLayout_, nullptr);
         vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
+        vkDestroyDescriptorSetLayout(device_, cloudSetLayout_, nullptr);
         vkDestroyDescriptorSetLayout(device_, descriptorSetLayout_, nullptr);
         vkDestroyRenderPass(device_, renderPass_, nullptr);
         vkDestroyCommandPool(device_, commandPool_, nullptr);

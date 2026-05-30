@@ -172,6 +172,13 @@ public:
     {
         return {-kTerrainWorldSize * 0.5f + (i + 0.5f) * dx_, cellY(j), -kTerrainWorldSize * 0.5f + (k + 0.5f) * dz_};
     }
+    // Copy the currently-viewed cloud-water field (immutable snapshot) into dst, which must
+    // hold at least nx*ny*nz floats. Used to upload the volume to the GPU each frame.
+    void copyCloudField(float* dst) const
+    {
+        const std::vector<float>& q = aQc();
+        std::memcpy(dst, q.data(), q.size() * sizeof(float));
+    }
     bool isSolid(int i, int j, int k) const { return solid_[idx(i, j, k)] != 0u; }
     int surfaceCell(int i, int k) const { return surfaceJ_[static_cast<std::size_t>(k) * nx_ + i]; }
     glm::vec3 velocity(int i, int j, int k) const { int c = idx(i, j, k); return {aU()[c], aV()[c], aW()[c]}; }
