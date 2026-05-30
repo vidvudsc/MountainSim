@@ -47,6 +47,8 @@ struct WeatherParams {
     float accretion = 2.2f;       // 1/s collision-coalescence: rain sweeps up cloud droplets
     float rainEvap = 0.25f;       // rain evaporation scale in subsaturated air
     float buoyancy = 1.0f;        // buoyancy multiplier
+    float lightningRate = 0.45f;  // stochastic flash frequency once storm charge builds
+    float lightningThreshold = 0.34f; // required cloud/rain/updraft charge before flashes fire
     int pressureIters = 24;       // Jacobi pressure iterations
     float timeScale = 45.0f;      // sim seconds per real second
     float vScale = 18.0f;         // atmosphere-depth scale: physical altitude = renderHeight * vScale
@@ -99,6 +101,7 @@ public:
         surfaceJ_.assign(static_cast<std::size_t>(nx_) * nz_, 0);
         precipRate_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
         precipAccum_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
+        lightning_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
         // Render thread only reads the latest finished snapshot, so keep a tiny ring
         // (a couple of frames of slack so a snapshot is never freed while being read).
         maxHistory_ = 3;
@@ -149,6 +152,9 @@ public:
                 }
         std::fill(precipRate_.begin(), precipRate_.end(), 0.0f);
         std::fill(precipAccum_.begin(), precipAccum_.end(), 0.0f);
+        std::fill(lightning_.begin(), lightning_.end(), 0.0f);
+        lightningFlash_ = 0.0f;
+        lightningTick_ = 0;
         simTime_ = 0.0f;
         auto snap = makeSnapshot();
         {
@@ -205,6 +211,8 @@ public:
     glm::vec3 velocity(int i, int j, int k) const { int c = idx(i, j, k); return {aU()[c], aV()[c], aW()[c]}; }
     float cloudAt(int i, int j, int k) const { return aQc()[idx(i, j, k)]; }
     float rainAt(int i, int j, int k) const { return aQr()[idx(i, j, k)]; }
+    float lightningAt(int i, int k) const { return aLightning()[static_cast<std::size_t>(k) * nx_ + i]; }
+    float lightningFlash() const { return viewSnap_ ? viewSnap_->lightningFlash : lightningFlash_; }
 
     // ---- history / scrubber (render thread) ----------------------------------------------
     int historyCount() const
@@ -301,11 +309,16 @@ private:
     std::vector<float> colHeight_;
     std::vector<int> surfaceJ_;
     std::vector<float> precipRate_, precipAccum_;
+    std::vector<float> lightning_;
+    float lightningFlash_ = 0.0f;
+    int lightningTick_ = 0;
 
     // Rolling history for the timeline scrubber. Snapshots are immutable once published, so
     // the render thread can read one (held alive by shared_ptr) while the worker keeps stepping.
     struct Snapshot {
         std::vector<float> u, v, w, theta, qv, qc, qr;
+        std::vector<float> lightning;
+        float lightningFlash = 0.0f;
         float simTime = 0.0f;
     };
     std::deque<std::shared_ptr<const Snapshot>> history_;
@@ -349,11 +362,14 @@ private:
     const std::vector<float>& aQv() const { return viewSnap_ ? viewSnap_->qv : qv_; }
     const std::vector<float>& aQc() const { return viewSnap_ ? viewSnap_->qc : qc_; }
     const std::vector<float>& aQr() const { return viewSnap_ ? viewSnap_->qr : qr_; }
+    const std::vector<float>& aLightning() const { return viewSnap_ ? viewSnap_->lightning : lightning_; }
 
     std::shared_ptr<Snapshot> makeSnapshot() const
     {
         auto s = std::make_shared<Snapshot>();
         s->u = u_; s->v = v_; s->w = w_; s->theta = theta_; s->qv = qv_; s->qc = qc_; s->qr = qr_;
+        s->lightning = lightning_;
+        s->lightningFlash = lightningFlash_;
         s->simTime = simTime_;
         return s;
     }
@@ -991,6 +1007,49 @@ private:
             precipRate_[col] += fall;
             precipAccum_[col] += fall;
         });
+        updateLightning(dt, p);
+    }
+
+    void updateLightning(float dt, const WeatherParams& p)
+    {
+        ++lightningTick_;
+        float columnDecay = std::exp(-dt * 1.65f);
+        float flashDecay = std::exp(-dt * 2.4f);
+        lightningFlash_ *= flashDecay;
+        if (p.lightningRate <= 0.0f) {
+            for (float& v : lightning_) v *= columnDecay;
+            return;
+        }
+
+        for (int k = 0; k < nz_; ++k) {
+            for (int i = 0; i < nx_; ++i) {
+                int col = k * nx_ + i;
+                lightning_[col] *= columnDecay;
+                float charge = 0.0f;
+                int baseJ = glm::clamp(surfaceJ_[col] + 1, 0, ny_ - 1);
+                for (int j = baseJ; j < ny_; ++j) {
+                    int c = idx(i, j, k);
+                    if (solid_[c]) continue;
+                    float cloud = qc_[c] * 1000.0f; // g/kg-ish display scale
+                    float rain = qr_[c] * 1000.0f;
+                    if (cloud < 0.015f && rain < 0.008f) continue;
+                    float heightFrac = static_cast<float>(j - baseJ + 1) / static_cast<float>(std::max(1, ny_ - baseJ));
+                    float updraft = std::max(v_[c], 0.0f);
+                    float localCharge = (cloud * 0.55f + rain * 1.65f) * (0.28f + updraft) * heightFrac;
+                    charge = std::max(charge, localCharge);
+                }
+
+                float excess = charge - p.lightningThreshold;
+                if (excess <= 0.0f) continue;
+                float chance = glm::clamp(excess * p.lightningRate * dt * 0.55f, 0.0f, 0.65f);
+                float r = 0.5f + 0.5f * hashNoise(i + lightningTick_ * 17, lightningTick_ * 31, k - lightningTick_ * 13);
+                if (r < chance) {
+                    float flash = glm::clamp(0.45f + excess * 0.85f, 0.0f, 1.0f);
+                    lightning_[col] = std::max(lightning_[col], flash);
+                    lightningFlash_ = std::max(lightningFlash_, flash);
+                }
+            }
+        }
     }
 
     void project(float dt, const WeatherParams& p)

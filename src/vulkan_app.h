@@ -101,6 +101,7 @@ private:
     int weatherGridY_ = 56;
     bool showClouds_ = true;
     bool showRain_ = true;
+    bool showLightning_ = true;
     bool showSliceH_ = true;     // horizontal (Y) plane
     bool showSliceV_ = true;     // vertical plane
     int sliceH_ = 14;            // Y index for the horizontal plane
@@ -1742,6 +1743,8 @@ private:
                 p.turbulence = 0.06f;
                 p.terrainFlow = 0.35f;
                 p.autoThresh = 0.0025f;
+                p.lightningRate = 0.02f;
+                p.lightningThreshold = 0.95f;
                 p.timeScale = 55.0f;
                 break;
             case 2: // Orographic cloud
@@ -1761,6 +1764,8 @@ private:
                 p.autoThresh = 0.00035f;
                 p.accretion = 1.8f;
                 p.rainEvap = 0.35f;
+                p.lightningRate = 0.18f;
+                p.lightningThreshold = 0.52f;
                 p.timeScale = 45.0f;
                 break;
             case 3: // Storm buildup
@@ -1781,6 +1786,8 @@ private:
                 p.accretion = 3.6f;
                 p.rainEvap = 0.18f;
                 p.buoyancy = 1.45f;
+                p.lightningRate = 1.10f;
+                p.lightningThreshold = 0.24f;
                 p.timeScale = 34.0f;
                 break;
             case 4: // Rain shadow
@@ -1800,6 +1807,8 @@ private:
                 p.autoThresh = 0.00045f;
                 p.accretion = 2.8f;
                 p.rainEvap = 0.42f;
+                p.lightningRate = 0.42f;
+                p.lightningThreshold = 0.38f;
                 p.timeScale = 50.0f;
                 break;
             case 5: // Valley fog
@@ -1820,6 +1829,8 @@ private:
                 p.accretion = 0.8f;
                 p.rainEvap = 0.55f;
                 p.buoyancy = 0.65f;
+                p.lightningRate = 0.0f;
+                p.lightningThreshold = 1.0f;
                 p.timeScale = 30.0f;
                 break;
             default:
@@ -1867,6 +1878,8 @@ private:
         ImGui::SliderFloat("Accretion", &weatherParams_.accretion, 0.0f, 8.0f, "%.1f");
         ImGui::SliderFloat("Rain evap", &weatherParams_.rainEvap, 0.0f, 1.0f, "%.2f");
         ImGui::SliderFloat("Buoyancy", &weatherParams_.buoyancy, 0.0f, 2.5f, "%.2f");
+        ImGui::SliderFloat("Lightning rate", &weatherParams_.lightningRate, 0.0f, 2.0f, "%.2f");
+        ImGui::SliderFloat("Lightning threshold", &weatherParams_.lightningThreshold, 0.05f, 1.2f, "%.2f");
 
         ImGui::SeparatorText("Solver");
         ImGui::SliderInt("Pressure iters", &weatherParams_.pressureIters, 6, 60);
@@ -1895,7 +1908,8 @@ private:
         ImGui::Begin("Slices & view");
         ImGui::Checkbox("Clouds", &showClouds_); ImGui::SameLine();
         ImGui::Checkbox("Rain", &showRain_); ImGui::SameLine();
-        ImGui::Checkbox("Wind", &showWindStreaks_);
+        ImGui::Checkbox("Wind", &showWindStreaks_); ImGui::SameLine();
+        ImGui::Checkbox("Lightning", &showLightning_);
 
         ImGui::SeparatorText("Clouds");
         ImGui::Checkbox("Volumetric (GPU ray-march)", &cloudVolumetric_);
@@ -2032,6 +2046,75 @@ private:
                                     IM_COL32(120, 150, 210, static_cast<int>(a * 255)), 1.4f);
                         ++drawn;
                     }
+        }
+
+        // --- lightning: short-lived storm-column discharge, sourced by the solver ---
+        if (showLightning_) {
+            float flash = weather_.lightningFlash();
+            if (flash > 0.02f) {
+                ImVec2 ds = ImGui::GetIO().DisplaySize;
+                int alpha = static_cast<int>(glm::clamp(flash * 26.0f, 0.0f, 34.0f));
+                dl->AddRectFilled(ImVec2(0.0f, 0.0f), ds, IM_COL32(180, 205, 255, alpha));
+            }
+
+            float dxz = kTerrainWorldSize / static_cast<float>(std::max(1, nx));
+            int drawn = 0;
+            for (int k = 0; k < nz && drawn < 80; ++k) {
+                for (int i = 0; i < nx && drawn < 80; ++i) {
+                    float intensity = weather_.lightningAt(i, k);
+                    if (intensity <= 0.06f) continue;
+
+                    int sj = glm::clamp(weather_.surfaceCell(i, k), 0, ny - 1);
+                    int bestJ = std::min(ny - 1, sj + std::max(4, ny / 3));
+                    float bestMass = 0.0f;
+                    for (int j = sj + 1; j < ny; ++j) {
+                        if (weather_.isSolid(i, j, k)) continue;
+                        float mass = weather_.cloudAt(i, j, k) + weather_.rainAt(i, j, k) * 2.0f;
+                        if (mass > bestMass) { bestMass = mass; bestJ = j; }
+                    }
+
+                    glm::vec3 cloud = weather_.cellCenter(i, bestJ, k);
+                    glm::vec3 ground = weather_.cellCenter(i, sj, k);
+                    if (occludedByTerrain(cloud)) continue;
+
+                    float seed = static_cast<float>((i + 19) * 37 + (k + 7) * 71);
+                    glm::vec3 prev = cloud;
+                    ImVec2 prevSc; float prevDepth;
+                    if (!projectVolume(prev, viewProj, prevSc, prevDepth)) continue;
+
+                    int coreA = static_cast<int>(glm::clamp(210.0f * intensity, 0.0f, 235.0f));
+                    int glowA = static_cast<int>(glm::clamp(80.0f * intensity, 0.0f, 120.0f));
+                    for (int s = 1; s <= 7; ++s) {
+                        float t = static_cast<float>(s) / 7.0f;
+                        glm::vec3 next = glm::mix(cloud, ground, t);
+                        if (s < 7) {
+                            float wiggle = dxz * (0.85f - 0.45f * t);
+                            next.x += std::sin(seed * 0.173f + s * 2.19f) * wiggle;
+                            next.z += std::sin(seed * 0.217f - s * 1.67f) * wiggle;
+                        }
+                        ImVec2 nextSc; float nextDepth;
+                        if (projectVolume(next, viewProj, nextSc, nextDepth)) {
+                            dl->AddLine(prevSc, nextSc, IM_COL32(120, 165, 255, glowA), 5.0f);
+                            dl->AddLine(prevSc, nextSc, IM_COL32(235, 248, 255, coreA), 1.6f);
+                            prevSc = nextSc;
+                        }
+                        prev = next;
+                    }
+
+                    if (intensity > 0.45f) {
+                        glm::vec3 mid = glm::mix(cloud, ground, 0.52f);
+                        glm::vec3 end = mid + glm::vec3(std::sin(seed) * dxz * 2.4f,
+                                                        -(cloud.y - ground.y) * 0.18f,
+                                                        std::cos(seed * 1.3f) * dxz * 2.4f);
+                        ImVec2 a, b; float da, db;
+                        if (projectVolume(mid, viewProj, a, da) && projectVolume(end, viewProj, b, db)) {
+                            dl->AddLine(a, b, IM_COL32(130, 175, 255, glowA), 3.6f);
+                            dl->AddLine(a, b, IM_COL32(235, 248, 255, coreA), 1.1f);
+                        }
+                    }
+                    ++drawn;
+                }
+            }
         }
 
         // --- wind streaks on whichever planes are shown ---
