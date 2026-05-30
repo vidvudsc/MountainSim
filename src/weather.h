@@ -114,17 +114,32 @@ public:
         if (!configured_) return;
         vScale_ = p.vScale;
         glm::vec3 wind = windVector(p);
+        float physDomain = (lidY_ - baseY_) * vScale_;
+        float rhSurface = p.inflowRH * 0.65f;  // interior ~55% RH near ground
+        float rhAloft = 0.25f;                // tapers to ~25% at lid
+        float windRamp = 30.0f;   // physical metres over which wind ramps from surface
         for (int k = 0; k < nz_; ++k)
             for (int j = 0; j < ny_; ++j)
                 for (int i = 0; i < nx_; ++i) {
                     int c = idx(i, j, k);
                     float th = thetaEnv(j, p);
-                    theta_[c] = th;
+                    theta_[c] = th + 0.15f * hashNoise(i, j, k);  // seed convection
                     float T = th * exner(cellY(j));
-                    qv_[c] = p.inflowRH * qSat(T, pressureAt(cellY(j)));
+                    float pres = pressureAt(cellY(j));
+                    float y = cellY(j);
+                    // Moisture decays with height: moist surface, dry aloft.
+                    // The inflow boundary (applyInflow) keeps the upwind faces at full
+                    // inflow humidity so the moist airmass advects in naturally.
+                    float frac = physDomain > 0.0f ? (physAlt(y) / physDomain) : 0.0f;
+                    float rh = glm::mix(rhSurface, rhAloft, glm::clamp(frac, 0.0f, 1.0f));
+                    qv_[c] = rh * qSat(T, pres);
                     qc_[c] = 0.0f; qr_[c] = 0.0f;
-                    if (solid_[c]) { u_[c] = v_[c] = w_[c] = 0.0f; }
-                    else { u_[c] = wind.x; v_[c] = 0.0f; w_[c] = wind.z; }
+                    if (solid_[c]) { u_[c] = v_[c] = w_[c] = 0.0f; continue; }
+                    // Near-surface wind ramp: friction reduces speed close to terrain
+                    float terrainY = colHeight_[k * nx_ + i];
+                    float hag = y - terrainY;  // height above ground
+                    float wf = glm::clamp(hag / windRamp, 0.4f, 1.0f);
+                    u_[c] = wind.x * wf; v_[c] = 0.0f; w_[c] = wind.z * wf;
                 }
         std::fill(precipRate_.begin(), precipRate_.end(), 0.0f);
         std::fill(precipAccum_.begin(), precipAccum_.end(), 0.0f);
@@ -406,6 +421,16 @@ private:
     {
         float a = glm::radians(p.windDirDeg);
         return {std::cos(a) * p.windSpeed, 0.0f, std::sin(a) * p.windSpeed};
+    }
+    // Deterministic hash returning [-1, +1] — seeds convection without random library.
+    static float hashNoise(int i, int j, int k)
+    {
+        std::uint32_t h = static_cast<std::uint32_t>(i) * 73856093u
+                        ^ static_cast<std::uint32_t>(j) * 19349663u
+                        ^ static_cast<std::uint32_t>(k) * 83492791u;
+        h = (h ^ (h >> 13)) * 0x5bd1e995u;
+        h = (h ^ (h >> 15));
+        return static_cast<float>(h & 0x7fffffffu) / 2147483647.5f - 1.0f;
     }
 
     template <class F>
