@@ -96,6 +96,7 @@ private:
     Weather weather_;
     WeatherParams weatherParams_{};
     bool weatherRunning_ = false;
+    int weatherPreset_ = 0;
     int weatherGridXZ_ = 88;
     int weatherGridY_ = 56;
     bool showClouds_ = true;
@@ -1723,6 +1724,96 @@ private:
         weather_.setViewFrame(-1);
     }
 
+    void applyWeatherPreset(int preset)
+    {
+        WeatherParams p{};
+        switch (preset) {
+            case 1: // Dry wind
+                p.windSpeed = 10.0f;
+                p.windDirDeg = 18.0f;
+                p.inflowRH = 0.34f;
+                p.surfaceTempC = 19.0f;
+                p.thetaLapse = 0.0065f;
+                p.solarHeating = 0.012f;
+                p.irCooling = 0.0030f;
+                p.surfaceDrag = 0.65f;
+                p.windNudge = 0.18f;
+                p.autoThresh = 0.0025f;
+                p.timeScale = 55.0f;
+                break;
+            case 2: // Orographic cloud
+                p.windSpeed = 8.5f;
+                p.windDirDeg = 22.0f;
+                p.inflowRH = 0.88f;
+                p.surfaceTempC = 13.0f;
+                p.thetaLapse = 0.0045f;
+                p.solarHeating = 0.008f;
+                p.irCooling = 0.0035f;
+                p.surfaceDrag = 0.75f;
+                p.windNudge = 0.12f;
+                p.autoconv = 0.0012f;
+                p.autoThresh = 0.00035f;
+                p.accretion = 1.8f;
+                p.rainEvap = 0.35f;
+                p.timeScale = 45.0f;
+                break;
+            case 3: // Storm buildup
+                p.windSpeed = 5.5f;
+                p.windDirDeg = -12.0f;
+                p.inflowRH = 0.96f;
+                p.surfaceTempC = 24.0f;
+                p.thetaLapse = 0.0008f;
+                p.solarHeating = 0.022f;
+                p.irCooling = 0.0022f;
+                p.surfaceDrag = 0.95f;
+                p.windNudge = 0.07f;
+                p.autoconv = 0.0024f;
+                p.autoThresh = 0.00025f;
+                p.accretion = 3.6f;
+                p.rainEvap = 0.18f;
+                p.buoyancy = 1.45f;
+                p.timeScale = 34.0f;
+                break;
+            case 4: // Rain shadow
+                p.windSpeed = 12.0f;
+                p.windDirDeg = 35.0f;
+                p.inflowRH = 0.78f;
+                p.surfaceTempC = 16.0f;
+                p.thetaLapse = 0.0052f;
+                p.solarHeating = 0.010f;
+                p.irCooling = 0.0038f;
+                p.surfaceDrag = 0.58f;
+                p.windNudge = 0.22f;
+                p.autoconv = 0.0017f;
+                p.autoThresh = 0.00045f;
+                p.accretion = 2.8f;
+                p.rainEvap = 0.42f;
+                p.timeScale = 50.0f;
+                break;
+            case 5: // Valley fog
+                p.windSpeed = 1.6f;
+                p.windDirDeg = 0.0f;
+                p.inflowRH = 0.94f;
+                p.surfaceTempC = 5.0f;
+                p.thetaLapse = 0.0075f;
+                p.solarHeating = 0.002f;
+                p.irCooling = 0.0060f;
+                p.surfaceDrag = 1.25f;
+                p.windNudge = 0.03f;
+                p.autoconv = 0.0007f;
+                p.autoThresh = 0.0009f;
+                p.accretion = 0.8f;
+                p.rainEvap = 0.55f;
+                p.buoyancy = 0.65f;
+                p.timeScale = 30.0f;
+                break;
+            default:
+                break;
+        }
+        weatherParams_ = p;
+        weather_.reset(weatherParams_);
+    }
+
     void drawWeatherControls()
     {
         ImGui::SetNextWindowPos(ImVec2(712, 18), ImGuiCond_FirstUseEver);
@@ -1730,6 +1821,8 @@ private:
         ImGui::Begin("Weather");
         ImGui::Text("sim time: %.0f s   grid %dx%dx%d", weather_.simTime(), weather_.nx(), weather_.ny(), weather_.nz());
         ImGui::Text("boxes: %d", weather_.nx() * weather_.ny() * weather_.nz());
+        const char* presets[] = {"Default", "Dry wind", "Orographic cloud", "Storm buildup", "Rain shadow", "Valley fog"};
+        if (ImGui::Combo("Preset", &weatherPreset_, presets, IM_ARRAYSIZE(presets))) applyWeatherPreset(weatherPreset_);
         if (ImGui::Button(weatherRunning_ ? "Pause" : "Run")) weatherRunning_ = !weatherRunning_;
         ImGui::SameLine();
         if (ImGui::Button("Reset")) { weather_.reset(weatherParams_); }
