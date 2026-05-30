@@ -85,7 +85,7 @@ public:
         u_.assign(n, 0.0f); v_.assign(n, 0.0f); w_.assign(n, 0.0f);
         theta_.assign(n, 0.0f); qv_.assign(n, 0.0f); qc_.assign(n, 0.0f); qr_.assign(n, 0.0f);
         u2_.assign(n, 0.0f); v2_.assign(n, 0.0f); w2_.assign(n, 0.0f);
-        s2_.assign(n, 0.0f);
+        s2_.assign(n, 0.0f); advectFwd_.assign(n, 0.0f); advectBack_.assign(n, 0.0f);
         // p_ carries one extra "zero" slot at index n: the precomputed Poisson stencil
         // points excluded (solid/boundary) neighbours at it so the SOR sweep can gather
         // all six neighbours branchlessly.
@@ -284,7 +284,7 @@ private:
     float simTime_ = 0.0f;
 
     std::vector<float> u_, v_, w_, theta_, qv_, qc_, qr_;
-    std::vector<float> u2_, v2_, w2_, s2_, p_, div_;
+    std::vector<float> u2_, v2_, w2_, s2_, advectFwd_, advectBack_, p_, div_;
     std::vector<std::uint8_t> solid_;
 
     // Precomputed Poisson stencil for the pressure solve. The linear system only changes
@@ -594,6 +594,45 @@ private:
         });
     }
 
+    void advectField(const std::vector<float>& src, std::vector<float>& dst, float dt, float extraVy, bool reverse) const
+    {
+        float sign = reverse ? 1.0f : -1.0f;
+        parallelFor(static_cast<int>(cellCount()), [&](int c) {
+            if (solid_[c]) { dst[c] = src[c]; return; }
+            int i = c % nx_;
+            int j = (c / nx_) % ny_;
+            int k = c / (nx_ * ny_);
+            float gi = i + sign * (u_[c] * dt) / dx_;
+            float gj = j + sign * ((v_[c] + extraVy) * dt) / dy_;
+            float gk = k + sign * (w_[c] * dt) / dz_;
+            dst[c] = trilinear(src, gi, gj, gk);
+        });
+    }
+
+    void macCormackAdvect(const std::vector<float>& src, std::vector<float>& dst, float dt, float extraVy)
+    {
+        advectField(src, advectFwd_, dt, extraVy, false);
+        advectField(advectFwd_, advectBack_, dt, extraVy, true);
+        parallelFor(static_cast<int>(cellCount()), [&](int c) {
+            if (solid_[c]) { dst[c] = src[c]; return; }
+            int i = c % nx_, j = (c / nx_) % ny_, k = c / (nx_ * ny_);
+            float lo = src[c], hi = src[c];
+            for (int dz = -1; dz <= 1; ++dz)
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        int ni = glm::clamp(i + dx, 0, nx_ - 1);
+                        int nj = glm::clamp(j + dy, 0, ny_ - 1);
+                        int nk = glm::clamp(k + dz, 0, nz_ - 1);
+                        int n = idx(ni, nj, nk);
+                        if (solid_[n]) continue;
+                        lo = std::min(lo, src[n]);
+                        hi = std::max(hi, src[n]);
+                    }
+            float corrected = advectFwd_[c] + 0.5f * (src[c] - advectBack_[c]);
+            dst[c] = glm::clamp(corrected, lo, hi);
+        });
+    }
+
     float vorticityMag(int i, int j, int k) const
     {
         int ip = std::min(i + 1, nx_ - 1), im = std::max(i - 1, 0);
@@ -720,10 +759,10 @@ private:
         u_.swap(u2_); v_.swap(v2_); w_.swap(w2_);
 
         // 4. Advect scalars.
-        semiLagrangian(theta_, s2_, dt, 0.0f); theta_.swap(s2_);
-        semiLagrangian(qv_, s2_, dt, 0.0f); qv_.swap(s2_);
-        semiLagrangian(qc_, s2_, dt, 0.0f); qc_.swap(s2_);
-        semiLagrangian(qr_, s2_, dt, -p.rainFall); qr_.swap(s2_); // rain falls
+        macCormackAdvect(theta_, s2_, dt, 0.0f); theta_.swap(s2_);
+        macCormackAdvect(qv_, s2_, dt, 0.0f); qv_.swap(s2_);
+        macCormackAdvect(qc_, s2_, dt, 0.0f); qc_.swap(s2_);
+        macCormackAdvect(qr_, s2_, dt, -p.rainFall); qr_.swap(s2_); // rain falls
 
         // 5. Boundaries before projection.
         applyInflow(p);
