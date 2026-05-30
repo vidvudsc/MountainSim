@@ -38,7 +38,7 @@ struct WeatherParams {
     float windNudge = 0.18f;      // 1/s relaxation of interior wind toward prevailing
     float rainFall = 6.0f;        // m/s rain terminal velocity
     float autoconv = 0.0016f;     // 1/s cloud -> rain conversion
-    float autoThresh = 0.0008f;   // kg/kg cloud water threshold for autoconversion (0.8 g/kg)
+    float autoThresh = 0.0001f;   // kg/kg cloud water threshold for autoconversion (0.1 g/kg)
     float accretion = 2.2f;       // 1/s collision-coalescence: rain sweeps up cloud droplets
     float rainEvap = 0.25f;       // rain evaporation scale in subsaturated air
     float buoyancy = 1.0f;        // buoyancy multiplier
