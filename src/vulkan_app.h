@@ -1710,6 +1710,8 @@ private:
         ImGui::SeparatorText("Moisture");
         ImGui::SliderFloat("Rain fall speed", &weatherParams_.rainFall, 1.0f, 12.0f, "%.1f m/s");
         ImGui::SliderFloat("Autoconversion", &weatherParams_.autoconv, 0.0f, 0.006f, "%.4f");
+        ImGui::SliderFloat("Cloud threshold", &weatherParams_.autoThresh, 0.0001f, 0.005f, "%.4f kg/kg");
+        ImGui::SliderFloat("Accretion", &weatherParams_.accretion, 0.0f, 8.0f, "%.1f");
         ImGui::SliderFloat("Rain evap", &weatherParams_.rainEvap, 0.0f, 1.0f, "%.2f");
         ImGui::SliderFloat("Buoyancy", &weatherParams_.buoyancy, 0.0f, 2.5f, "%.2f");
 
