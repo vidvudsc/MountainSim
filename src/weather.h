@@ -38,6 +38,8 @@ struct WeatherParams {
     float surfaceDrag = 0.8f;     // 1/s friction in the surface layer
     float windNudge = 0.10f;      // 1/s relaxation of interior wind toward prevailing (gentle
                                   // so thermally-driven circulations aren't damped back flat)
+    float gustStrength = 0.16f;   // low-frequency evolving inflow variation
+    float turbulence = 0.10f;     // small continual eddy forcing, m/s^2-ish
     float rainFall = 6.0f;        // m/s rain terminal velocity
     float autoconv = 0.0016f;     // 1/s cloud -> rain conversion
     float autoThresh = 0.0001f;   // kg/kg cloud water threshold for autoconversion (0.1 g/kg)
@@ -422,8 +424,13 @@ private:
     }
     glm::vec3 windVector(const WeatherParams& p) const
     {
-        float a = glm::radians(p.windDirDeg);
-        return {std::cos(a) * p.windSpeed, 0.0f, std::sin(a) * p.windSpeed};
+        float gust = p.gustStrength * (0.55f * std::sin(simTime_ * 0.017f)
+                                     + 0.32f * std::sin(simTime_ * 0.041f + 1.7f)
+                                     + 0.13f * std::sin(simTime_ * 0.073f - 2.1f));
+        float dirWobble = p.gustStrength * 10.0f * std::sin(simTime_ * 0.023f + 0.9f);
+        float a = glm::radians(p.windDirDeg + dirWobble);
+        float speed = std::max(0.0f, p.windSpeed * (1.0f + gust));
+        return {std::cos(a) * speed, 0.0f, std::sin(a) * speed};
     }
     // Deterministic hash returning [-1, +1] — seeds convection without random library.
     static float hashNoise(int i, int j, int k)
@@ -434,6 +441,12 @@ private:
         h = (h ^ (h >> 13)) * 0x5bd1e995u;
         h = (h ^ (h >> 15));
         return static_cast<float>(h & 0x7fffffffu) / 2147483647.5f - 1.0f;
+    }
+    static float waveNoise(int i, int j, int k, float t)
+    {
+        float a = std::sin(i * 0.37f + j * 0.61f + k * 0.43f + t);
+        float b = std::sin(i * 0.17f - j * 0.29f + k * 0.71f - t * 1.73f);
+        return (a + 0.55f * b) / 1.55f;
     }
 
     template <class F>
@@ -713,7 +726,9 @@ private:
         // 1. Body forces: buoyancy on vertical velocity + interior wind relaxation + drag.
         parallelFor(static_cast<int>(cellCount()), [&](int c) {
             if (solid_[c]) { u_[c] = v_[c] = w_[c] = 0.0f; return; }
+            int i = c % nx_;
             int j = (c / nx_) % ny_;
+            int k = c / (nx_ * ny_);
             float th0 = thetaEnv(j, p);
             float qv0 = qvEnvLevel(j, p);
             // Bound the potential-temperature anomaly. Real convective plumes stay within a
@@ -743,6 +758,13 @@ private:
             // relax horizontal wind toward prevailing (large-scale pressure gradient proxy)
             u_[c] += (wind.x - u_[c]) * std::min(1.0f, p.windNudge * dt);
             w_[c] += (wind.z - w_[c]) * std::min(1.0f, p.windNudge * dt);
+            if (p.turbulence > 0.0f) {
+                float openAir = 1.0f - glm::smoothstep(0.86f, 1.0f, topFrac);
+                float t = simTime_ * 0.08f;
+                u_[c] += p.turbulence * waveNoise(i, j, k, t) * openAir * dt;
+                v_[c] += p.turbulence * 0.35f * waveNoise(i + 17, j, k - 9, t * 1.3f) * openAir * dt;
+                w_[c] += p.turbulence * waveNoise(i - 5, j + 11, k, t * 0.9f) * openAir * dt;
+            }
             // safety clamp so a transient can never run the solver away
             u_[c] = glm::clamp(u_[c], -35.0f, 35.0f);
             v_[c] = glm::clamp(v_[c], -35.0f, 35.0f);
