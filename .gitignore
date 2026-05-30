@@ -3,3 +3,5 @@ downloads/
 imgui.ini
 .DS_Store
 .cache/
+# Large unused PBR texture packs (renderer uses procedural colors); keep out of the repo.
+assets/textures/
