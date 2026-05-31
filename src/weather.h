@@ -28,8 +28,11 @@
 struct WeatherParams {
     float windSpeed = 7.0f;       // m/s prevailing inflow
     float windDirDeg = 20.0f;     // 0 -> blowing toward +x
-    float inflowRH = 0.92f;       // relative humidity of incoming air (moist enough that the
-                                  // convective overturning below still condenses visible cloud)
+    float inflowRH = 0.84f;       // relative humidity of incoming air. ~0.84 gives realistic
+                                  // partly-cloudy cover (scattered/broken cumulus over the
+                                  // peaks, ~25% sky); higher floods the sky, drier goes clear.
+                                  // The convective turbulence comes from stability/heating, not
+                                  // this, so thinning the cloud keeps the dynamics.
     float surfaceTempC = 14.0f;   // base surface temperature
     float thetaLapse = 0.0040f;   // K/m potential-temperature gradient (stability) -- slightly
                                   // less stable so daytime heating drives real convection
