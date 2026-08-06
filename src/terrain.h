@@ -363,10 +363,7 @@ private:
                 int zu = std::min(kTerrainSize - 1, z + 1);
                 float sx = heights_[idx(xr, z)] - heights_[idx(xl, z)];
                 float sz = heights_[idx(x, zu)] - heights_[idx(x, zd)];
-                // Physical gradient (rise per world unit) so material/snow thresholds are
-                // resolution independent; 0.77 reproduces the original 193-grid tuning.
-                float stepWorld = kTerrainWorldSize / static_cast<float>(kTerrainSize - 1);
-                float slope = glm::clamp(glm::length(glm::vec2(sx, sz)) / (2.0f * stepWorld) * 0.77f, 0.0f, 1.0f);
+                float slope = glm::clamp(glm::length(glm::vec2(sx, sz)) * 0.45f, 0.0f, 1.0f);
                 float height01 = glm::clamp(heights_[index] / maxH, 0.0f, 1.0f);
                 float sediment = (index < static_cast<int>(displaySediment_.size())) ? displaySediment_[index] : 0.0f;
                 float water = (index < static_cast<int>(displayWater_.size())) ? displayWater_[index] : 0.0f;

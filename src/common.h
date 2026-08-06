@@ -10,9 +10,7 @@
 #include <string>
 #include <vector>
 
-// Sampling density only — the generation recipe is untouched, so the shapes are the
-// same as the original 193 grid, just resolved with 4x the vertices.
-constexpr int kTerrainSize = 385;
+constexpr int kTerrainSize = 193;
 constexpr float kTerrainWorldSize = 165.0f;
 constexpr int kMaxFramesInFlight = 2;
 
