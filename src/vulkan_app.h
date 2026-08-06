@@ -60,6 +60,13 @@ private:
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkPipeline skyPipeline_ = VK_NULL_HANDLE;
+    // 4x MSAA: scene renders into a transient multisampled color target that resolves
+    // into the swapchain image at the end of the pass. On Apple TBDR GPUs both MSAA
+    // attachments can live in tile memory (lazily allocated), so this is close to free.
+    static constexpr VkSampleCountFlagBits kMsaaSamples = VK_SAMPLE_COUNT_4_BIT;
+    VkImage colorImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory colorMemory_ = VK_NULL_HANDLE;
+    VkImageView colorView_ = VK_NULL_HANDLE;
     VkImage depthImage_ = VK_NULL_HANDLE;
     VkDeviceMemory depthMemory_ = VK_NULL_HANDLE;
     VkImageView depthView_ = VK_NULL_HANDLE;
@@ -99,6 +106,8 @@ private:
     // weather ImGui windows hidden; per-feature toggles keep their state for re-enable.
     bool weatherEnabled_ = true;
     bool weatherRunning_ = false;
+    bool sunShadows_ = true;    // terrain self-shadowing (heightmap ray-march)
+    bool cloudShadows_ = true;  // clouds darken the ground under them
     int weatherPreset_ = 0;
     int weatherGridXZ_ = 88;
     int weatherGridY_ = 56;
@@ -124,7 +133,7 @@ private:
     int cloudSteps_ = 48;               // primary march samples
     float cloudSunAbsorb_ = 1.0f;       // self-shadow strength
     float cloudCoverage_ = 0.0f;        // density floor (trims wisps)
-    static constexpr int kCloudHeightRes = 192;                 // occlusion heightmap resolution
+    static constexpr int kCloudHeightRes = 384;                 // occlusion/shadow heightmap resolution
     static constexpr int kCloudMaxCells = 144 * 96 * 144;       // SSBO capacity (grid slider maxima)
     VkDescriptorSetLayout cloudSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout cloudPipelineLayout_ = VK_NULL_HANDLE;
@@ -187,6 +196,7 @@ private:
     float dayLengthSec_ = 90.0f;    // real seconds per simulated day
     float season_ = 0.4f;           // -1 = winter, +1 = summer (solar declination scale)
     float latitudeDeg_ = 45.0f;
+    float moonPhase_ = 0.5f;        // 0 = new, 0.5 = full; advances 1/29.53 per sim day
 
     void initWindow()
     {
@@ -220,6 +230,7 @@ private:
         createCloudPipeline();
         createSlicePipeline();
         createSliceResources();
+        createColorResources();
         createDepthResources();
         createFramebuffers();
         createCommandPool();
@@ -473,26 +484,36 @@ private:
 
     void createRenderPass()
     {
+        // 0: multisampled color (tile-transient), 1: multisampled depth, 2: swapchain resolve.
         VkAttachmentDescription color{};
         color.format = swapchainFormat_;
-        color.samples = VK_SAMPLE_COUNT_1_BIT;
+        color.samples = kMsaaSamples;
         color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; // resolved, never stored
         color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         VkAttachmentDescription depth{};
         depth.format = VK_FORMAT_D32_SFLOAT;
-        depth.samples = VK_SAMPLE_COUNT_1_BIT;
+        depth.samples = kMsaaSamples;
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        VkAttachmentDescription resolve{};
+        resolve.format = swapchainFormat_;
+        resolve.samples = VK_SAMPLE_COUNT_1_BIT;
+        resolve.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        resolve.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        resolve.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resolve.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference resolveRef{2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkSubpassDescription subpass{};
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         subpass.colorAttachmentCount = 1;
         subpass.pColorAttachments = &colorRef;
+        subpass.pResolveAttachments = &resolveRef;
         subpass.pDepthStencilAttachment = &depthRef;
         VkSubpassDependency dependency{};
         dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
@@ -500,7 +521,7 @@ private:
         dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
         dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
         dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        std::array<VkAttachmentDescription, 2> attachments{color, depth};
+        std::array<VkAttachmentDescription, 3> attachments{color, depth, resolve};
         VkRenderPassCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
         createInfo.attachmentCount = static_cast<std::uint32_t>(attachments.size());
@@ -524,7 +545,19 @@ private:
         skybox.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         skybox.descriptorCount = 1;
         skybox.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        std::array<VkDescriptorSetLayoutBinding, 2> bindings{ubo, skybox};
+        // Cloud volume + terrain heightmap, shared with the cloud pass, so the terrain
+        // shader can ray-march sun shadows and cloud shadows.
+        VkDescriptorSetLayoutBinding cloudVol{};
+        cloudVol.binding = 2;
+        cloudVol.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        cloudVol.descriptorCount = 1;
+        cloudVol.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutBinding heightMap{};
+        heightMap.binding = 3;
+        heightMap.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        heightMap.descriptorCount = 1;
+        heightMap.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        std::array<VkDescriptorSetLayoutBinding, 4> bindings{ubo, skybox, cloudVol, heightMap};
         VkDescriptorSetLayoutCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         createInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
@@ -591,7 +624,7 @@ private:
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         raster.lineWidth = 1.0f;
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisample.rasterizationSamples = kMsaaSamples;
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         depth.depthTestEnable = VK_TRUE;
         depth.depthWriteEnable = VK_TRUE;
@@ -650,7 +683,7 @@ private:
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         raster.lineWidth = 1.0f;
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisample.rasterizationSamples = kMsaaSamples;
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         depth.depthTestEnable = VK_FALSE;
         depth.depthWriteEnable = VK_FALSE;
@@ -738,7 +771,7 @@ private:
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         raster.lineWidth = 1.0f;
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisample.rasterizationSamples = kMsaaSamples;
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         depth.depthTestEnable = VK_FALSE;
         depth.depthWriteEnable = VK_FALSE;
@@ -951,7 +984,7 @@ private:
         raster.polygonMode = VK_POLYGON_MODE_FILL; raster.cullMode = VK_CULL_MODE_NONE;
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; raster.lineWidth = 1.0f;
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisample.rasterizationSamples = kMsaaSamples;
         // Depth-test against the terrain (drawn earlier in the pass) for a clean per-pixel
         // cutout, but don't write depth so the translucent slice can't occlude later draws.
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -1192,7 +1225,21 @@ private:
         endSingleTimeCommands(commandBuffer);
     }
 
-    void createImage(std::uint32_t width, std::uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& memory)
+    // Returns the index of a matching memory type, or -1 (no throw) so callers can
+    // fall back — used to prefer lazily-allocated (tile-only) memory for transient
+    // MSAA/depth attachments where available.
+    int findMemoryTypeOpt(std::uint32_t typeFilter, VkMemoryPropertyFlags properties)
+    {
+        VkPhysicalDeviceMemoryProperties memoryProperties{};
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memoryProperties);
+        for (std::uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
+            if ((typeFilter & (1u << i)) && (memoryProperties.memoryTypes[i].propertyFlags & properties) == properties) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    void createImage(std::uint32_t width, std::uint32_t height, VkFormat format, VkImageUsageFlags usage,
+                     VkImage& image, VkDeviceMemory& memory, VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT)
     {
         VkImageCreateInfo createInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         createInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -1203,14 +1250,18 @@ private:
         createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
         createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         createInfo.usage = usage;
-        createInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        createInfo.samples = samples;
         createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         checkVk(vkCreateImage(device_, &createInfo, nullptr, &image), "Failed to create image");
         VkMemoryRequirements req{};
         vkGetImageMemoryRequirements(device_, image, &req);
         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         alloc.allocationSize = req.size;
-        alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        int typeIndex = -1;
+        if (usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)
+            typeIndex = findMemoryTypeOpt(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT);
+        if (typeIndex < 0) typeIndex = static_cast<int>(findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+        alloc.memoryTypeIndex = static_cast<std::uint32_t>(typeIndex);
         checkVk(vkAllocateMemory(device_, &alloc, nullptr, &memory), "Failed to allocate image memory");
         vkBindImageMemory(device_, image, memory, 0);
     }
@@ -1310,15 +1361,25 @@ private:
 
     void createDepthResources()
     {
-        createImage(swapchainExtent_.width, swapchainExtent_.height, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, depthImage_, depthMemory_);
+        createImage(swapchainExtent_.width, swapchainExtent_.height, VK_FORMAT_D32_SFLOAT,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                    depthImage_, depthMemory_, kMsaaSamples);
         depthView_ = createImageView(depthImage_, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+
+    void createColorResources()
+    {
+        createImage(swapchainExtent_.width, swapchainExtent_.height, swapchainFormat_,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                    colorImage_, colorMemory_, kMsaaSamples);
+        colorView_ = createImageView(colorImage_, swapchainFormat_, VK_IMAGE_ASPECT_COLOR_BIT);
     }
 
     void createFramebuffers()
     {
         framebuffers_.resize(swapchainImageViews_.size());
         for (std::size_t i = 0; i < swapchainImageViews_.size(); ++i) {
-            std::array<VkImageView, 2> attachments{swapchainImageViews_[i], depthView_};
+            std::array<VkImageView, 3> attachments{colorView_, depthView_, swapchainImageViews_[i]};
             VkFramebufferCreateInfo createInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
             createInfo.renderPass = renderPass_;
             createInfo.attachmentCount = static_cast<std::uint32_t>(attachments.size());
@@ -1334,6 +1395,12 @@ private:
     {
         for (VkFramebuffer framebuffer : framebuffers_) vkDestroyFramebuffer(device_, framebuffer, nullptr);
         framebuffers_.clear();
+        if (colorView_) vkDestroyImageView(device_, colorView_, nullptr);
+        if (colorImage_) vkDestroyImage(device_, colorImage_, nullptr);
+        if (colorMemory_) vkFreeMemory(device_, colorMemory_, nullptr);
+        colorView_ = VK_NULL_HANDLE;
+        colorImage_ = VK_NULL_HANDLE;
+        colorMemory_ = VK_NULL_HANDLE;
         if (depthView_) vkDestroyImageView(device_, depthView_, nullptr);
         if (depthImage_) vkDestroyImage(device_, depthImage_, nullptr);
         if (depthMemory_) vkFreeMemory(device_, depthMemory_, nullptr);
@@ -1359,6 +1426,7 @@ private:
         vkDeviceWaitIdle(device_);
         cleanupSwapchain();
         createSwapchain();
+        createColorResources();
         createDepthResources();
         createFramebuffers();
         ImGui_ImplVulkan_SetMinImageCount(2);
@@ -1403,7 +1471,7 @@ private:
     {
         std::array<VkDescriptorPoolSize, 2> poolSizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * kMaxFramesInFlight},
         }};
         VkDescriptorPoolCreateInfo createInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         createInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
@@ -1427,7 +1495,9 @@ private:
             imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             imageInfo.imageView = skyboxView_;
             imageInfo.sampler = skyboxSampler_;
-            std::array<VkWriteDescriptorSet, 2> writes{};
+            VkDescriptorImageInfo cloudInfo{cloudSampler_, cloudFieldViews_[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkDescriptorImageInfo hgtInfo{cloudSampler_, cloudHeightView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            std::array<VkWriteDescriptorSet, 4> writes{};
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = descriptorSets_[i];
             writes[0].dstBinding = 0;
@@ -1440,6 +1510,18 @@ private:
             writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[1].descriptorCount = 1;
             writes[1].pImageInfo = &imageInfo;
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet = descriptorSets_[i];
+            writes[2].dstBinding = 2;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[2].descriptorCount = 1;
+            writes[2].pImageInfo = &cloudInfo;
+            writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[3].dstSet = descriptorSets_[i];
+            writes[3].dstBinding = 3;
+            writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[3].descriptorCount = 1;
+            writes[3].pImageInfo = &hgtInfo;
             vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
     }
@@ -1515,7 +1597,7 @@ private:
         info.MinImageCount = 2;
         info.ImageCount = static_cast<std::uint32_t>(swapchainImages_.size());
         info.PipelineInfoMain.RenderPass = renderPass_;
-        info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        info.PipelineInfoMain.MSAASamples = kMsaaSamples;
         ImGui_ImplVulkan_Init(&info);
     }
 
@@ -1622,9 +1704,12 @@ private:
     void advanceClock(float dtReal)
     {
         if (clockAuto_ && dayLengthSec_ > 0.1f) {
+            float before = timeOfDay_;
             timeOfDay_ += dtReal / dayLengthSec_ * 24.0f;
             timeOfDay_ = std::fmod(timeOfDay_, 24.0f);
             if (timeOfDay_ < 0.0f) timeOfDay_ += 24.0f;
+            // Midnight wrap = one simulated day: advance the lunar cycle.
+            if (timeOfDay_ < before) moonPhase_ = std::fmod(moonPhase_ + 1.0f / 29.53f, 1.0f);
         }
     }
 
@@ -1633,8 +1718,10 @@ private:
         TerrainSettings& s = terrain_.settings();
         glm::vec3 sunDir = sunDirection();
         float sunWarmth = glm::smoothstep(0.0f, 0.55f, sunDir.y);
-        glm::vec3 sunColor = glm::mix(glm::vec3(1.0f, 0.58f, 0.34f), glm::vec3(1.0f, 0.93f, 0.78f), sunWarmth);
+        float daylight = glm::smoothstep(-0.10f, 0.12f, sunDir.y); // 0 at night, 1 by day
+        glm::vec3 sunColor = glm::mix(glm::vec3(1.0f, 0.58f, 0.34f), glm::vec3(1.0f, 0.93f, 0.78f), sunWarmth) * daylight;
         glm::vec3 fogColor = glm::mix(glm::vec3(0.30f, 0.36f, 0.42f), glm::vec3(0.42f, 0.56f, 0.68f), sunWarmth);
+        fogColor = glm::mix(glm::vec3(0.045f, 0.060f, 0.085f), fogColor, daylight); // night fog goes dark blue
         SceneUniforms ubo{};
         ubo.view = camera_.view();
         ubo.proj = glm::perspective(glm::radians(58.0f), static_cast<float>(swapchainExtent_.width) / static_cast<float>(swapchainExtent_.height), 0.1f, 650.0f);
@@ -1656,6 +1743,10 @@ private:
                                       static_cast<float>(weather_.nz()), static_cast<float>(kCloudHeightRes));
         }
         ubo.cloudParams = glm::vec4(cloudDensity_, static_cast<float>(cloudSteps_), cloudSunAbsorb_, cloudCoverage_);
+        ubo.lightning = (weatherEnabled_ && showLightning_) ? weather_.lightningLight() : glm::vec4(0.0f);
+        bool anyCloud = weatherEnabled_ && weather_.ready() && weather_.viewMaxQc() > 2.0e-5f;
+        ubo.shadowParams = glm::vec4(sunShadows_ ? 1.0f : 0.0f,
+                                     (cloudShadows_ && anyCloud) ? 1.0f : 0.0f, moonPhase_, 0.0f);
         void* data = nullptr;
         vkMapMemory(device_, uniformMemories_[frame], 0, sizeof(ubo), 0, &data);
         std::memcpy(data, &ubo, sizeof(ubo));
@@ -1735,6 +1826,11 @@ private:
         ImGui::SliderFloat("Fog density", &terrain_.settings().fogDensity, 0.0f, 0.03f, "%.3f");
         ImGui::Checkbox("Wireframe", &wireframe_);
 
+        ImGui::SeparatorText("Lighting");
+        ImGui::Checkbox("Sun shadows", &sunShadows_);
+        ImGui::SameLine();
+        ImGui::Checkbox("Cloud shadows", &cloudShadows_);
+
         ImGui::SeparatorText("Weather");
         ImGui::Checkbox("Enable weather", &weatherEnabled_);
 
@@ -1748,6 +1844,7 @@ private:
         ImGui::SliderFloat("Day length", &dayLengthSec_, 15.0f, 600.0f, "%.0f s/day");
         ImGui::SliderFloat("Season", &season_, -1.0f, 1.0f, "%.2f (-1 winter / +1 summer)");
         ImGui::SliderFloat("Latitude", &latitudeDeg_, 0.0f, 66.0f, "%.0f deg");
+        ImGui::SliderFloat("Moon phase", &moonPhase_, 0.0f, 1.0f, "%.2f (0 new / 0.5 full)");
         ImGui::End();
 
         ImGui::SetNextWindowPos(ImVec2(365, 306), ImGuiCond_FirstUseEver);
@@ -1760,7 +1857,7 @@ private:
             camera_.target = glm::vec3(0.0f, 16.0f, 0.0f);
             camera_.yaw = -90.0f;
             camera_.pitch = -18.0f;
-            camera_.distance = 108.0f;
+            camera_.distance = 132.0f;
         }
         ImGui::TextWrapped("One-finger click-drag orbits. Two-finger vertical swipe zooms; horizontal swipe pans. Shift + right drag pans. WASD pans the target.");
         camera_.updateFromOrbit();
@@ -2158,24 +2255,44 @@ private:
             }
         }
 
-        // --- rain streaks ---
+        // --- rain streaks: jittered off the grid, slanted by the local wind, and falling
+        //     over time, so it reads as rain instead of a static lattice of blue ticks ---
         if (showRain_ && weather_.viewMaxQr() > 6.0e-5f) {
+            float now = static_cast<float>(ImGui::GetTime());
+            float dxz = kTerrainWorldSize / static_cast<float>(nx);
+            float dyC = weather_.cellCenter(0, 1, 0).y - weather_.cellCenter(0, 0, 0).y;
+            auto hash01 = [](int a, int b, int c) {
+                std::uint32_t h = static_cast<std::uint32_t>(a) * 73856093u
+                                ^ static_cast<std::uint32_t>(b) * 19349663u
+                                ^ static_cast<std::uint32_t>(c) * 83492791u;
+                h = (h ^ (h >> 13)) * 0x5bd1e995u;
+                return static_cast<float>(h & 0xffffu) / 65535.0f;
+            };
             int drawn = 0;
-            for (int k = 0; k < nz && drawn < 9000; ++k)
-                for (int j = 0; j < ny; ++j)
+            for (int k = 0; k < nz && drawn < 6000; ++k)
+                for (int j = 0; j < ny && drawn < 6000; ++j)
                     for (int i = 0; i < nx; ++i) {
                         if (weather_.isSolid(i, j, k)) continue;
                         float qr = weather_.rainAt(i, j, k);
                         if (qr <= 6.0e-5f) continue;
                         glm::vec3 c = weather_.cellCenter(i, j, k);
                         if (occludedByTerrain(c)) continue;
-                        ImVec2 sc; float depth;
-                        if (!projectVolume(c, viewProj, sc, depth)) continue;
-                        float sz = glm::clamp(1100.0f / depth, 2.0f, 14.0f);
-                        float a = glm::clamp(qr * 9000.0f, 0.10f, 0.7f);
-                        dl->AddLine(ImVec2(sc.x, sc.y - sz * 0.6f), ImVec2(sc.x, sc.y + sz * 0.9f),
-                                    IM_COL32(120, 150, 210, static_cast<int>(a * 255)), 1.4f);
-                        ++drawn;
+                        glm::vec3 vel = weather_.velocity(i, j, k);
+                        glm::vec3 fall = glm::normalize(glm::vec3(vel.x, -weatherParams_.rainFall, vel.z));
+                        float a = glm::clamp(qr * 5500.0f, 0.05f, 0.30f);
+                        for (int s = 0; s < 2; ++s) {
+                            float h1 = hash01(i * 3 + s * 17, j * 7, k * 11);
+                            float h2 = hash01(i * 5, j * 13 + s * 29, k * 3);
+                            float phase = glm::fract(h1 + now * (1.1f + 0.5f * h2));
+                            glm::vec3 p0 = c + glm::vec3((h2 - 0.5f) * dxz, (0.5f - phase) * dyC, (h1 - 0.5f) * dxz);
+                            glm::vec3 p1 = p0 + fall * (dxz * 0.55f);
+                            ImVec2 s0, s1; float d0, d1;
+                            if (!projectVolume(p0, viewProj, s0, d0) || !projectVolume(p1, viewProj, s1, d1)) continue;
+                            float distFade = glm::clamp(220.0f / d0, 0.35f, 1.0f);
+                            dl->AddLine(s0, s1, IM_COL32(176, 194, 222, static_cast<int>(a * distFade * 255.0f)), 1.0f);
+                            ++drawn;
+                        }
+                        if (drawn >= 6000) break;
                     }
         }
 

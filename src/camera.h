@@ -11,7 +11,7 @@ struct Camera {
     glm::vec3 target{0.0f, 16.0f, 0.0f};
     float yaw = -90.0f;
     float pitch = -18.0f;
-    float distance = 108.0f;
+    float distance = 132.0f;
     float panSpeed = 0.18f;
     bool orbiting = false;
     bool panning = false;

@@ -16,9 +16,23 @@ layout(set = 0, binding = 0) uniform SceneUniforms {
     vec4 fogColor;
     vec4 terrain;
     vec4 effects;
+    mat4 invViewProj;
+    vec4 volMin;
+    vec4 volMax;
+    vec4 cloudGrid;
+    vec4 cloudParams;
+    vec4 lightning;    // xyz flash world pos, w intensity
+    vec4 shadowParams; // x sun-shadows on, y cloud-shadow strength
 } u;
 
+// Shared with the cloud pass: cloud water volume + terrain height, for shadow marches.
+layout(set = 0, binding = 2) uniform sampler3D cloudTex;
+layout(set = 0, binding = 3) uniform sampler2D heightTex;
+
 layout(location = 0) out vec4 outColor;
+
+const float WS = 165.0;                       // kTerrainWorldSize
+const vec3 TEXDIM = vec3(144.0, 96.0, 144.0); // allocated cloud texture extent
 
 float hash(vec2 p)
 {
@@ -49,6 +63,64 @@ float fbm(vec2 p)
         amp *= 0.5;
     }
     return sum;
+}
+
+float terrainH(vec2 xz)
+{
+    float R = u.cloudGrid.w;
+    vec2 rel = clamp((xz + WS * 0.5) / WS, 0.0, 1.0);
+    vec2 tc = (rel * (R - 1.0) + 0.5) / R;
+    return texture(heightTex, tc).r;
+}
+
+float qcAt(vec3 p)
+{
+    vec3 rel = (p - u.volMin.xyz) / (u.volMax.xyz - u.volMin.xyz);
+    if (any(lessThan(rel, vec3(0.0))) || any(greaterThan(rel, vec3(1.0)))) return 0.0;
+    vec3 tc = (rel * (u.cloudGrid.xyz - 1.0) + 0.5) / TEXDIM;
+    return texture(cloudTex, tc).r;
+}
+
+// Soft terrain self-shadow: march the heightmap toward the sun, tracking the minimum
+// angular clearance (classic penumbra approximation). Growing steps keep it ~20 taps.
+float sunTerrainShadow(vec3 wp, vec3 sd)
+{
+    if (u.shadowParams.x < 0.5 || sd.y <= 0.03) return 1.0;
+    float res = 1.0;
+    float t = 2.2;
+    for (int i = 0; i < 22; ++i) {
+        vec3 p = wp + sd * t;
+        if (p.y > u.terrain.x + 8.0) break; // above any possible terrain
+        float h = terrainH(p.xz);
+        res = min(res, 6.0 * (p.y - h + 0.9) / t);
+        if (res < 0.0) break;
+        t += clamp(t * 0.32, 1.1, 7.0);
+    }
+    // Fade out at grazing sun angles: the coarse heightmap aliases into dappled noise
+    // there, and direct light is nearly gone at the horizon anyway.
+    return mix(1.0, clamp(res, 0.0, 1.0), smoothstep(0.03, 0.14, sd.y));
+}
+
+// Cloud shadow: accumulate cloud water along the sun ray up to the volume lid.
+float cloudShadow(vec3 wp, vec3 sd)
+{
+    float strength = u.shadowParams.y;
+    if (strength <= 0.0 || sd.y <= 0.05) return 1.0;
+    // Cap the path length: at grazing sun the ray would otherwise sweep the whole
+    // volume diagonally and alias the coarse cloud grid into patchy bands.
+    float tTop = min((u.volMax.y - wp.y) / max(sd.y, 0.10), 300.0);
+    float dt = tTop / 8.0;
+    vec3 p = wp + sd * (0.5 * dt);
+    float od = 0.0;
+    for (int i = 0; i < 8; ++i) { od += qcAt(p); p += sd * dt; }
+    float trans = exp(-od * dt * u.cloudParams.x * 0.9);
+    // keep a floor: even under a storm deck skylight leaks in
+    return mix(1.0, max(trans, 0.22), strength * smoothstep(0.05, 0.18, sd.y));
+}
+
+vec3 aces(vec3 x)
+{
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
 }
 
 void main()
@@ -106,13 +178,17 @@ void main()
     float layer = smoothstep(0.47, 0.53, sin(vWorldPos.y * 1.7 + broad * 2.8) * 0.5 + 0.5);
     float cutDepth = clamp((vWorldPos.y + 5.0) / (heightScale + 8.0), 0.0, 1.0);
     vec3 compactEarth = vec3(0.20, 0.18, 0.15);
-    vec3 weatheredStone = vec3(0.42, 0.39, 0.31);
-    vec3 paleLayer = vec3(0.58, 0.53, 0.40);
+    vec3 weatheredStone = vec3(0.29, 0.27, 0.225);
+    vec3 paleLayer = vec3(0.44, 0.40, 0.31);
     vec3 darkLayer = vec3(0.13, 0.14, 0.13);
     vec3 cutMaterial = mix(compactEarth, weatheredStone, cutDepth);
-    cutMaterial = mix(cutMaterial, paleLayer, layer * 0.28);
+    cutMaterial = mix(cutMaterial, paleLayer, layer * 0.24);
     cutMaterial = mix(cutMaterial, darkLayer, (1.0 - cutDepth) * 0.22 + stratum * 0.12);
     cutMaterial *= 0.86 + fine * 0.12;
+    // Dark topsoil band just under the surface so the wall meets the terrain with soil,
+    // not a pale weathered-stone stripe.
+    float below = max(terrainH(vWorldPos.xz) - vWorldPos.y, 0.0);
+    cutMaterial = mix(vec3(0.135, 0.112, 0.085), cutMaterial, smoothstep(0.4, 3.0, below));
     cutMaterial = mix(cutMaterial, vec3(0.08, 0.085, 0.08), bottomFace);
 
     float wet = 0.0;
@@ -137,13 +213,40 @@ void main()
     float spec = pow(max(dot(n, halfDir), 0.0), mix(22.0, 112.0, wet + snowMask * 0.5 + iceMask)) * (wet + snowMask * 0.10 + iceMask * 0.45 + coldSheen * 0.08);
     float shade = mix(0.58, 1.0, smoothstep(-0.12, 0.36, dot(n, lightDir)));
 
-    vec3 color = base * (vec3(0.15, 0.18, 0.20) + u.sunColor.xyz * diff * shade);
-    color += u.sunColor.xyz * spec * 0.9;
-    color += vec3(0.18, 0.25, 0.30) * rim * 0.045;
+    // Cast shadows: terrain self-shadowing + cloud shadows attenuate direct sun only.
+    float sunVis = sunTerrainShadow(vWorldPos, lightDir) * cloudShadow(vWorldPos, lightDir);
 
+    // Sky ambient follows the day/night clock, and the moon brightens the night in
+    // proportion to its phase and elevation.
+    float daylight = smoothstep(-0.08, 0.20, lightDir.y);
+    vec3 md = normalize(vec3(-lightDir.x + 0.24, -lightDir.y + 0.16, -lightDir.z - 0.30));
+    float litFrac = 0.5 - 0.5 * cos(6.2831853 * u.shadowParams.z);
+    float moonAmb = litFrac * smoothstep(0.0, 0.25, md.y) * (1.0 - daylight);
+    vec3 ambient = mix(vec3(0.020, 0.028, 0.048) * (0.7 + 2.4 * moonAmb), vec3(0.15, 0.18, 0.22), daylight);
+    // slight extra skylight on upward-facing surfaces
+    ambient *= 0.75 + 0.25 * clamp(n.y, 0.0, 1.0);
+
+    vec3 color = base * (ambient + u.sunColor.xyz * diff * shade * sunVis);
+    // faint directional moonlight so full-moon nights model the peaks
+    color += base * vec3(0.085, 0.10, 0.15) * max(dot(n, md), 0.0) * moonAmb;
+    color += u.sunColor.xyz * spec * 0.9 * sunVis;
+    color += vec3(0.18, 0.25, 0.30) * rim * 0.045 * (0.3 + 0.7 * daylight);
+
+    // Lightning flash as a real light source (cool white, distance falloff).
+    if (u.lightning.w > 0.001) {
+        vec3 toFlash = u.lightning.xyz - vWorldPos;
+        float d2 = dot(toFlash, toFlash);
+        float ndl = max(dot(n, normalize(toFlash)), 0.12);
+        color += base * vec3(0.62, 0.72, 1.0) * (u.lightning.w * 2.4 * ndl / (1.0 + d2 * 0.0022));
+    }
+
+    // Fog with sun-tinted inscatter: haze glows warm when looking toward the sun.
     float dist = length(u.cameraPos.xyz - vWorldPos);
     float fog = fogDensity <= 0.00001 ? 0.0 : clamp(1.0 - exp(-dist * fogDensity), 0.0, 0.92);
-    color = mix(color, u.fogColor.xyz, fog);
-    color = color / (color + vec3(1.0));
+    float sunAmount = max(dot(-viewDir, lightDir), 0.0);
+    vec3 fogCol = mix(u.fogColor.xyz, u.sunColor.xyz, 0.55 * pow(sunAmount, 6.0));
+    color = mix(color, fogCol, fog);
+
+    color = aces(color * 1.25);
     outColor = vec4(color, 1.0);
 }

@@ -17,6 +17,8 @@ layout(binding = 0) uniform SceneUniforms {
     vec4 volMax;      // world pos of cell-center (nx-1,ny-1,nz-1)
     vec4 cloudGrid;   // nx, ny, nz, heightmapRes
     vec4 cloudParams; // densityScale, steps, sunAbsorption, coverage
+    vec4 lightning;   // xyz flash world pos, w intensity
+    vec4 shadowParams;
 } u;
 
 // R16F textures with hardware filtering: one trilinear sample replaces the eight raw
@@ -48,7 +50,20 @@ float terrainHeight(vec2 xz)
     return texture(heightTex, tc).r;
 }
 
-float hash21(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+// Interleaved gradient noise: visibly better step-jitter distribution than a sine hash.
+float ign(vec2 p) { return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y)); }
+
+// Henyey-Greenstein phase (unnormalized) for anisotropic scattering.
+float hg(float mu, float g)
+{
+    float g2 = g * g;
+    return (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * mu, 1.5);
+}
+
+vec3 aces(vec3 x)
+{
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
 
 void main()
 {
@@ -75,11 +90,17 @@ void main()
     float coverage = u.cloudParams.w;
 
     // Jitter the start to break up slice banding.
-    float jitter = hash21(gl_FragCoord.xy) * stepLen;
+    float jitter = ign(gl_FragCoord.xy) * stepLen;
     float t = tN + jitter;
 
-    vec3 sunlit = u.sunColor.rgb;
-    vec3 shadow = u.fogColor.rgb * 0.55 + vec3(0.12, 0.14, 0.18);
+    vec3 sd = normalize(u.sunDir.xyz);
+    float daylight = smoothstep(-0.08, 0.15, sd.y);
+    // Anisotropic phase: bright silver lining looking sunward, softer looking away.
+    float mu = dot(rd, sd);
+    float phase = 0.45 + 0.65 * hg(mu, 0.5) / 3.0;
+    vec3 sunlit = u.sunColor.rgb * phase;
+    // Sky ambient keeps shadowed cloud bases blue-grey by day, near-black at night.
+    vec3 skyAmb = mix(vec3(0.012, 0.016, 0.032), vec3(0.30, 0.37, 0.48), daylight);
 
     float transmittance = 1.0;
     vec3 scattered = vec3(0.0);
@@ -97,17 +118,22 @@ void main()
         float lstep = stepLen * 1.5;
         vec3 lp = p;
         for (int l = 0; l < 4; ++l) {
-            lp += u.sunDir.xyz * lstep;
+            lp += sd * lstep;
             ld += max(0.0, sampleQc(lp) * densityScale);
         }
         float lightT = exp(-ld * lstep * sunAbsorb);
 
         float a = 1.0 - exp(-d * stepLen);
-        vec3 col = mix(shadow, sunlit, lightT);
+        vec3 col = skyAmb + sunlit * lightT;
+        // Lightning glow from inside the storm.
+        if (u.lightning.w > 0.001) {
+            vec3 toFlash = u.lightning.xyz - p;
+            col += vec3(0.60, 0.70, 1.0) * (u.lightning.w * 6.0 / (1.0 + dot(toFlash, toFlash) * 0.004));
+        }
         scattered += transmittance * a * col;     // premultiplied
         transmittance *= (1.0 - a);
         if (transmittance < 0.02) break;
     }
 
-    outColor = vec4(scattered, 1.0 - transmittance); // premultiplied-alpha over scene
+    outColor = vec4(aces(scattered * 1.25), 1.0 - transmittance); // premultiplied-alpha over scene
 }

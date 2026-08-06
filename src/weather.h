@@ -225,6 +225,22 @@ public:
     // Snapshot-wide maxima; 1.0 (i.e. "assume non-empty") when no snapshot exists yet.
     float viewMaxQc() const { return viewSnap_ ? viewSnap_->maxQc : 1.0f; }
     float viewMaxQr() const { return viewSnap_ ? viewSnap_->maxQr : 1.0f; }
+    // World-space focus of the strongest active lightning column plus flash intensity in
+    // w (zero when no flash) — lets the renderer light the scene from the discharge.
+    glm::vec4 lightningLight() const
+    {
+        float flash = lightningFlash();
+        if (flash <= 0.01f) return glm::vec4(0.0f);
+        const std::vector<float>& L = aLightning();
+        int best = -1;
+        float bv = 0.05f;
+        for (int c = 0; c < nx_ * nz_; ++c) {
+            if (L[c] > bv) { bv = L[c]; best = c; }
+        }
+        if (best < 0) return glm::vec4(0.0f);
+        glm::vec3 p = cellCenter(best % nx_, (2 * ny_) / 3, best / nx_);
+        return glm::vec4(p, flash);
+    }
 
     // ---- history / scrubber (render thread) ----------------------------------------------
     int historyCount() const

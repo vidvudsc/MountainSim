@@ -41,6 +41,8 @@ struct SceneUniforms {
     glm::vec4 volMax{};          // xyz: world position of cell-center (nx-1,ny-1,nz-1)
     glm::vec4 cloudGrid{};       // x,y,z = grid dims; w = heightmap resolution
     glm::vec4 cloudParams{};     // x density, y steps, z sun absorption, w coverage bias
+    glm::vec4 lightning{};       // xyz = world position of the active flash, w = intensity
+    glm::vec4 shadowParams{};    // x = terrain sun-shadows on/off, y = cloud-shadow strength
 };
 
 inline std::vector<char> readBinaryFile(const std::string& path)
