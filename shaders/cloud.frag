@@ -19,57 +19,33 @@ layout(binding = 0) uniform SceneUniforms {
     vec4 cloudParams; // densityScale, steps, sunAbsorption, coverage
 } u;
 
-layout(std430, binding = 1) readonly buffer CloudField { float qc[]; };
-layout(std430, binding = 2) readonly buffer HeightField { float hgt[]; };
+// R16F textures with hardware filtering: one trilinear sample replaces the eight raw
+// buffer fetches the old SSBO path needed, and one bilinear sample replaces four.
+layout(binding = 1) uniform sampler3D cloudTex;   // cloud water qc (kg/kg)
+layout(binding = 2) uniform sampler2D heightTex;  // terrain surface height
 
 const float WS = 165.0; // kTerrainWorldSize
-
-int NX() { return int(u.cloudGrid.x); }
-int NY() { return int(u.cloudGrid.y); }
-int NZ() { return int(u.cloudGrid.z); }
-
-float fetchQc(int i, int j, int k)
-{
-    i = clamp(i, 0, NX() - 1);
-    j = clamp(j, 0, NY() - 1);
-    k = clamp(k, 0, NZ() - 1);
-    return qc[(k * NY() + j) * NX() + i]; // matches Weather::idx
-}
+// Allocated 3D texture extent (the grid slider maxima, kCloudTex* in vulkan_app.h);
+// only the active cloudGrid.xyz sub-region holds data and is ever sampled.
+const vec3 TEXDIM = vec3(144.0, 96.0, 144.0);
 
 // Cloud water at a world point, trilinearly interpolated. 0 outside the box.
 float sampleQc(vec3 p)
 {
     vec3 rel = (p - u.volMin.xyz) / (u.volMax.xyz - u.volMin.xyz);
     if (any(lessThan(rel, vec3(0.0))) || any(greaterThan(rel, vec3(1.0)))) return 0.0;
-    vec3 g = rel * (vec3(NX(), NY(), NZ()) - 1.0);
-    ivec3 i0 = ivec3(floor(g));
-    vec3 f = g - vec3(i0);
-    float c000 = fetchQc(i0.x,     i0.y,     i0.z);
-    float c100 = fetchQc(i0.x + 1, i0.y,     i0.z);
-    float c010 = fetchQc(i0.x,     i0.y + 1, i0.z);
-    float c110 = fetchQc(i0.x + 1, i0.y + 1, i0.z);
-    float c001 = fetchQc(i0.x,     i0.y,     i0.z + 1);
-    float c101 = fetchQc(i0.x + 1, i0.y,     i0.z + 1);
-    float c011 = fetchQc(i0.x,     i0.y + 1, i0.z + 1);
-    float c111 = fetchQc(i0.x + 1, i0.y + 1, i0.z + 1);
-    return mix(mix(mix(c000, c100, f.x), mix(c010, c110, f.x), f.y),
-               mix(mix(c001, c101, f.x), mix(c011, c111, f.x), f.y), f.z);
+    // rel [0,1] spans the centers of cells 0..n-1 of the active sub-region.
+    vec3 tc = (rel * (u.cloudGrid.xyz - 1.0) + 0.5) / TEXDIM;
+    return texture(cloudTex, tc).r;
 }
 
 // Terrain surface height at a world (x,z), bilinear over the uploaded heightmap.
 float terrainHeight(vec2 xz)
 {
-    float hr = u.cloudGrid.w;
-    int R = int(hr);
+    float R = u.cloudGrid.w;
     vec2 rel = clamp((xz + WS * 0.5) / WS, 0.0, 1.0);
-    vec2 g = rel * (hr - 1.0);
-    ivec2 i0 = ivec2(floor(g));
-    vec2 f = g - vec2(i0);
-    int x0 = clamp(i0.x, 0, R - 1), x1 = clamp(i0.x + 1, 0, R - 1);
-    int z0 = clamp(i0.y, 0, R - 1), z1 = clamp(i0.y + 1, 0, R - 1);
-    float h00 = hgt[z0 * R + x0], h10 = hgt[z0 * R + x1];
-    float h01 = hgt[z1 * R + x0], h11 = hgt[z1 * R + x1];
-    return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+    vec2 tc = (rel * (R - 1.0) + 0.5) / R;
+    return texture(heightTex, tc).r;
 }
 
 float hash21(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }

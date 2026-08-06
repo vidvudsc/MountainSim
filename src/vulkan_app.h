@@ -95,6 +95,9 @@ private:
     // --- weather / microclimate ---
     Weather weather_;
     WeatherParams weatherParams_{};
+    // Master switch (menu bar). Off = solver paused, all weather visuals and both
+    // weather ImGui windows hidden; per-feature toggles keep their state for re-enable.
+    bool weatherEnabled_ = true;
     bool weatherRunning_ = false;
     int weatherPreset_ = 0;
     int weatherGridXZ_ = 88;
@@ -128,12 +131,33 @@ private:
     VkPipeline cloudPipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool cloudPool_ = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, kMaxFramesInFlight> cloudSets_{};
-    std::array<VkBuffer, kMaxFramesInFlight> cloudFieldBuffers_{};
-    std::array<VkDeviceMemory, kMaxFramesInFlight> cloudFieldMemories_{};
+    // The cloud-water field lives in an R16F 3D texture so the march gets hardware
+    // trilinear filtering (1 sample instead of 8 raw buffer fetches per step); likewise
+    // the terrain-occlusion heightmap as an R16F 2D texture (1 sample instead of 4).
+    // Textures are allocated at the grid-slider maxima; only the active nx*ny*nz
+    // sub-region is copied (from a persistently-mapped staging buffer) and sampled.
+    static constexpr std::uint32_t kCloudTexX = 144, kCloudTexY = 96, kCloudTexZ = 144;
+    static_assert(kCloudTexX * kCloudTexY * kCloudTexZ == kCloudMaxCells);
+    std::array<VkBuffer, kMaxFramesInFlight> cloudFieldStaging_{};
+    std::array<VkDeviceMemory, kMaxFramesInFlight> cloudFieldStagingMemories_{};
     std::array<void*, kMaxFramesInFlight> cloudFieldMapped_{};
-    VkBuffer cloudHeightBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory cloudHeightMemory_ = VK_NULL_HANDLE;
+    std::array<VkImage, kMaxFramesInFlight> cloudFieldImages_{};
+    std::array<VkDeviceMemory, kMaxFramesInFlight> cloudFieldImageMemories_{};
+    std::array<VkImageView, kMaxFramesInFlight> cloudFieldViews_{};
+    std::array<bool, kMaxFramesInFlight> cloudUploadPending_{};
+    std::array<bool, kMaxFramesInFlight> cloudImageInit_{}; // first copy fills the whole texture
+    VkBuffer cloudHeightStaging_ = VK_NULL_HANDLE;
+    VkDeviceMemory cloudHeightStagingMemory_ = VK_NULL_HANDLE;
     void* cloudHeightMapped_ = nullptr;
+    VkImage cloudHeightImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory cloudHeightImageMemory_ = VK_NULL_HANDLE;
+    VkImageView cloudHeightView_ = VK_NULL_HANDLE;
+    bool cloudHeightUploadPending_ = false;
+    VkSampler cloudSampler_ = VK_NULL_HANDLE;
+    // Which weather snapshot each per-frame staging buffer holds (0 = the zero-filled
+    // initial contents). Skips the reconvert+re-upload whenever the snapshot is
+    // unchanged, i.e. every frame while the sim is paused.
+    std::array<std::uint64_t, kMaxFramesInFlight> cloudFieldToken_{};
 
     // --- field slice planes drawn as depth-tested 3D geometry (clean per-pixel terrain
     //     cutout, vs. the old per-vertex ImGui-overlay occlusion which was blocky) ---
@@ -144,6 +168,18 @@ private:
     std::array<VkDeviceMemory, kMaxFramesInFlight> sliceVertexMemories_{};
     std::array<void*, kMaxFramesInFlight> sliceVertexMapped_{};
     std::array<std::uint32_t, kMaxFramesInFlight> sliceVertexCount_{};
+    // Everything the slice geometry depends on. When a frame slot's key matches, its
+    // mapped vertex buffer already holds the right triangles and the whole CPU rebuild
+    // (thousands of weather_.sample calls per frame) is skipped — the common case
+    // whenever the sim is paused, and between solver steps while it runs.
+    struct SliceCacheKey {
+        std::uint64_t token = ~0ull;
+        int field = -1, sliceH = -1, sliceV = -1, vertAxis = -1;
+        bool showH = false, showV = false;
+        float lo = 0.0f, hi = 0.0f;
+        WeatherParams params{};
+    };
+    std::array<SliceCacheKey, kMaxFramesInFlight> sliceKey_{};
 
     // --- day/night clock (drives the sun for both rendering and the weather solver) ---
     bool clockAuto_ = true;         // auto-advance vs. manual scrub
@@ -356,11 +392,11 @@ private:
         return formats.front();
     }
 
-    VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& modes)
+    VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>&)
     {
-        for (VkPresentModeKHR mode : modes) {
-            if (mode == VK_PRESENT_MODE_MAILBOX_KHR) return mode;
-        }
+        // Always vsync. FIFO is the only mode the spec guarantees, and preferring
+        // MAILBOX (as before) would render uncapped wherever it exists — pure heat on
+        // a laptop with no visible benefit for an orbit-camera scene.
         return VK_PRESENT_MODE_FIFO_KHR;
     }
 
@@ -532,11 +568,12 @@ private:
         std::array<VkPipelineShaderStageCreateInfo, 2> stages{vertStage, fragStage};
 
         VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
-        std::array<VkVertexInputAttributeDescription, 4> attributes{{
+        std::array<VkVertexInputAttributeDescription, 5> attributes{{
             {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)},
             {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
             {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)},
-            {3, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, hydro)}
+            {3, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, hydro)},
+            {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, surface)}
         }};
         VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         vertexInput.vertexBindingDescriptionCount = 1;
@@ -655,12 +692,12 @@ private:
         ubo.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutBinding field{};
         field.binding = 1;
-        field.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        field.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         field.descriptorCount = 1;
         field.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutBinding height{};
         height.binding = 2;
-        height.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        height.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         height.descriptorCount = 1;
         height.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         std::array<VkDescriptorSetLayoutBinding, 3> bindings{ubo, field, height};
@@ -743,27 +780,76 @@ private:
 
     void createCloudResources()
     {
-        VkDeviceSize fieldBytes = static_cast<VkDeviceSize>(kCloudMaxCells) * sizeof(float);
+        auto makeSampledImage = [&](VkImageType type, VkExtent3D extent, VkImage& image, VkDeviceMemory& memory) {
+            VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ii.imageType = type;
+            ii.extent = extent;
+            ii.mipLevels = 1;
+            ii.arrayLayers = 1;
+            ii.format = VK_FORMAT_R16_SFLOAT;
+            ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            ii.samples = VK_SAMPLE_COUNT_1_BIT;
+            ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            checkVk(vkCreateImage(device_, &ii, nullptr, &image), "Failed to create cloud image");
+            VkMemoryRequirements req{};
+            vkGetImageMemoryRequirements(device_, image, &req);
+            VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            alloc.allocationSize = req.size;
+            alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            checkVk(vkAllocateMemory(device_, &alloc, nullptr, &memory), "Failed to allocate cloud image memory");
+            vkBindImageMemory(device_, image, memory, 0);
+        };
+        auto makeView = [&](VkImage image, VkImageViewType type) {
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = image;
+            vi.viewType = type;
+            vi.format = VK_FORMAT_R16_SFLOAT;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageView view = VK_NULL_HANDLE;
+            checkVk(vkCreateImageView(device_, &vi, nullptr, &view), "Failed to create cloud image view");
+            return view;
+        };
+
+        VkDeviceSize fieldBytes = static_cast<VkDeviceSize>(kCloudMaxCells) * sizeof(std::uint16_t);
         for (int i = 0; i < kMaxFramesInFlight; ++i) {
-            createBuffer(fieldBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            createBuffer(fieldBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                         cloudFieldBuffers_[i], cloudFieldMemories_[i]);
-            vkMapMemory(device_, cloudFieldMemories_[i], 0, fieldBytes, 0, &cloudFieldMapped_[i]);
+                         cloudFieldStaging_[i], cloudFieldStagingMemories_[i]);
+            vkMapMemory(device_, cloudFieldStagingMemories_[i], 0, fieldBytes, 0, &cloudFieldMapped_[i]);
             std::memset(cloudFieldMapped_[i], 0, fieldBytes);
+            makeSampledImage(VK_IMAGE_TYPE_3D, {kCloudTexX, kCloudTexY, kCloudTexZ},
+                             cloudFieldImages_[i], cloudFieldImageMemories_[i]);
+            cloudFieldViews_[i] = makeView(cloudFieldImages_[i], VK_IMAGE_VIEW_TYPE_3D);
+            cloudUploadPending_[i] = true; // first frame defines the layout and zeroes the texture
         }
-        VkDeviceSize hgtBytes = static_cast<VkDeviceSize>(kCloudHeightRes) * kCloudHeightRes * sizeof(float);
-        createBuffer(hgtBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VkDeviceSize hgtBytes = static_cast<VkDeviceSize>(kCloudHeightRes) * kCloudHeightRes * sizeof(std::uint16_t);
+        createBuffer(hgtBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     cloudHeightBuffer_, cloudHeightMemory_);
-        vkMapMemory(device_, cloudHeightMemory_, 0, hgtBytes, 0, &cloudHeightMapped_);
+                     cloudHeightStaging_, cloudHeightStagingMemory_);
+        vkMapMemory(device_, cloudHeightStagingMemory_, 0, hgtBytes, 0, &cloudHeightMapped_);
         std::memset(cloudHeightMapped_, 0, hgtBytes);
+        makeSampledImage(VK_IMAGE_TYPE_2D, {kCloudHeightRes, kCloudHeightRes, 1},
+                         cloudHeightImage_, cloudHeightImageMemory_);
+        cloudHeightView_ = makeView(cloudHeightImage_, VK_IMAGE_VIEW_TYPE_2D);
+        cloudHeightUploadPending_ = true;
+
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = VK_FILTER_LINEAR;
+        si.minFilter = VK_FILTER_LINEAR;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        checkVk(vkCreateSampler(device_, &si, nullptr, &cloudSampler_), "Failed to create cloud sampler");
     }
 
     void createCloudDescriptors()
     {
         std::array<VkDescriptorPoolSize, 2> poolSizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kMaxFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kMaxFramesInFlight},
         }};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
@@ -780,8 +866,8 @@ private:
         checkVk(vkAllocateDescriptorSets(device_, &alloc, cloudSets_.data()), "Failed to allocate cloud descriptor sets");
         for (int i = 0; i < kMaxFramesInFlight; ++i) {
             VkDescriptorBufferInfo uboInfo{uniformBuffers_[i], 0, sizeof(SceneUniforms)};
-            VkDescriptorBufferInfo fieldInfo{cloudFieldBuffers_[i], 0, VK_WHOLE_SIZE};
-            VkDescriptorBufferInfo hgtInfo{cloudHeightBuffer_, 0, VK_WHOLE_SIZE};
+            VkDescriptorImageInfo fieldInfo{cloudSampler_, cloudFieldViews_[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkDescriptorImageInfo hgtInfo{cloudSampler_, cloudHeightView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             std::array<VkWriteDescriptorSet, 3> writes{};
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = cloudSets_[i];
@@ -792,15 +878,15 @@ private:
             writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[1].dstSet = cloudSets_[i];
             writes[1].dstBinding = 1;
-            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[1].descriptorCount = 1;
-            writes[1].pBufferInfo = &fieldInfo;
+            writes[1].pImageInfo = &fieldInfo;
             writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[2].dstSet = cloudSets_[i];
             writes[2].dstBinding = 2;
-            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[2].descriptorCount = 1;
-            writes[2].pBufferInfo = &hgtInfo;
+            writes[2].pImageInfo = &hgtInfo;
             vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
     }
@@ -809,24 +895,31 @@ private:
     void uploadCloudHeightmap()
     {
         if (!cloudHeightMapped_) return;
-        float* h = static_cast<float*>(cloudHeightMapped_);
+        auto* h = static_cast<_Float16*>(cloudHeightMapped_);
         const float WS = kTerrainWorldSize;
         for (int z = 0; z < kCloudHeightRes; ++z) {
             float wz = -WS * 0.5f + (z / static_cast<float>(kCloudHeightRes - 1)) * WS;
             for (int x = 0; x < kCloudHeightRes; ++x) {
                 float wx = -WS * 0.5f + (x / static_cast<float>(kCloudHeightRes - 1)) * WS;
-                h[z * kCloudHeightRes + x] = terrain_.surfaceHeightAtWorld(wx, wz);
+                h[z * kCloudHeightRes + x] = static_cast<_Float16>(terrain_.surfaceHeightAtWorld(wx, wz));
             }
         }
+        cloudHeightUploadPending_ = true;
     }
 
     // Push the current cloud-water volume into this frame's storage buffer.
     void updateCloudData(std::uint32_t frame)
     {
-        if (!weather_.ready() || !cloudFieldMapped_[frame]) return;
+        if (!weatherEnabled_ || !weather_.ready() || !cloudFieldMapped_[frame]) return;
         int cells = weather_.nx() * weather_.ny() * weather_.nz();
         if (cells <= 0 || cells > kCloudMaxCells) return;
-        weather_.copyCloudField(static_cast<float*>(cloudFieldMapped_[frame]));
+        std::uint64_t token = weather_.viewToken();
+        if (token == cloudFieldToken_[frame]) return; // slot already holds this snapshot
+        const std::vector<float>& q = weather_.viewQc();
+        auto* dst = static_cast<_Float16*>(cloudFieldMapped_[frame]);
+        for (std::size_t c = 0; c < q.size(); ++c) dst[c] = static_cast<_Float16>(q[c]);
+        cloudUploadPending_[frame] = true;
+        cloudFieldToken_[frame] = token;
     }
 
     // ---- depth-tested 3D field-slice planes ------------------------------------------------
@@ -915,13 +1008,41 @@ private:
     // vertex buffer. The GPU then depth-tests them against the terrain for a clean cutout.
     void buildSliceGeometry(std::uint32_t frame)
     {
-        sliceVertexCount_[frame] = 0;
-        if (!weather_.ready() || !sliceVertexMapped_[frame]) return;
-        if (!showSliceH_ && !showSliceV_) return;
+        // Any early-out that zeroes the vertex count must also invalidate the cache key,
+        // otherwise re-enabling matches the stale key and skips the rebuild forever.
+        if (!weatherEnabled_ || !weather_.ready() || !sliceVertexMapped_[frame]) {
+            sliceVertexCount_[frame] = 0;
+            sliceKey_[frame] = SliceCacheKey{};
+            return;
+        }
+        if (!showSliceH_ && !showSliceV_) {
+            sliceVertexCount_[frame] = 0;
+            sliceKey_[frame] = SliceCacheKey{};
+            return;
+        }
         int nx = weather_.nx(), ny = weather_.ny(), nz = weather_.nz();
         WeatherField field = static_cast<WeatherField>(weatherField_);
         float lo, hi; stableColorRange(field, lo, hi);
         float range = std::max(1e-4f, hi - lo);
+
+        SliceCacheKey key;
+        key.token = weather_.viewToken();
+        key.field = weatherField_; key.sliceH = sliceH_; key.sliceV = sliceV_;
+        key.vertAxis = vertAxis_; key.showH = showSliceH_; key.showV = showSliceV_;
+        key.lo = lo; key.hi = hi; key.params = weatherParams_;
+        const SliceCacheKey& prev = sliceKey_[frame];
+        // lo/hi keep EMA-converging for a while after the field settles; a shift under
+        // half a percent of the range is far below one colormap step, so treat it as equal
+        // rather than rebuilding forever.
+        float eps = 0.005f * range;
+        if (prev.token == key.token && prev.field == key.field
+            && prev.sliceH == key.sliceH && prev.sliceV == key.sliceV
+            && prev.vertAxis == key.vertAxis && prev.showH == key.showH && prev.showV == key.showV
+            && std::abs(prev.lo - key.lo) <= eps && std::abs(prev.hi - key.hi) <= eps
+            && std::memcmp(&prev.params, &key.params, sizeof(WeatherParams)) == 0)
+            return; // buffer already holds this exact geometry
+
+        sliceVertexCount_[frame] = 0;
         auto* verts = static_cast<SliceVertex*>(sliceVertexMapped_[frame]);
         std::uint32_t n = 0;
         const float alpha = 0.6f;
@@ -969,6 +1090,7 @@ private:
             }
         }
         sliceVertexCount_[frame] = n;
+        sliceKey_[frame] = key;
     }
 
     std::uint32_t findMemoryType(std::uint32_t typeFilter, VkMemoryPropertyFlags properties)
@@ -1587,7 +1709,10 @@ private:
         ImGui::SliderFloat("Evaporation", &terrain_.settings().evaporation, 0.005f, 0.12f, "%.3f");
         ImGui::Checkbox("Show particles", &showFlowParticles_);
         ImGui::SliderFloat("Simulation speed", &erosionSpeed_, 0.06f, 1.0f, "%.2f");
-        if (erosionAnimating_) ImGui::BeginDisabled();
+        // Latch the disabled state: the button click flips erosionAnimating_ mid-frame,
+        // which used to call EndDisabled() without a matching BeginDisabled().
+        bool erosionDisabled = erosionAnimating_;
+        if (erosionDisabled) ImGui::BeginDisabled();
         if (ImGui::Button(erosionAnimating_ ? "Simulating" : "Start simulation")) {
             int drops = terrain_.settings().erosionDrops;
             terrain_.beginLiveErosion(drops);
@@ -1595,7 +1720,7 @@ private:
             erosionAnimating_ = true;
             terrainDirty_ = true;
         }
-        if (erosionAnimating_) ImGui::EndDisabled();
+        if (erosionDisabled) ImGui::EndDisabled();
         ImGui::End();
 
         ImGui::SetNextWindowPos(ImVec2(365, 18), ImGuiCond_FirstUseEver);
@@ -1609,6 +1734,9 @@ private:
         ImGui::Checkbox("Show sediment", &terrain_.settings().showSediment);
         ImGui::SliderFloat("Fog density", &terrain_.settings().fogDensity, 0.0f, 0.03f, "%.3f");
         ImGui::Checkbox("Wireframe", &wireframe_);
+
+        ImGui::SeparatorText("Weather");
+        ImGui::Checkbox("Enable weather", &weatherEnabled_);
 
         ImGui::SeparatorText("Time of day & sky");
         ImGui::Checkbox("Auto-advance", &clockAuto_);
@@ -1721,7 +1849,7 @@ private:
         if (!weather_.ready()) return;
         // The solver runs on its own thread; we only hand it inputs (including the live sun
         // from the clock) and always display the latest finished snapshot.
-        weather_.setControls(weatherRunning_, weatherParams_, sunDirection());
+        weather_.setControls(weatherRunning_ && weatherEnabled_, weatherParams_, sunDirection());
         weather_.setViewFrame(-1);
     }
 
@@ -1842,6 +1970,7 @@ private:
 
     void drawWeatherControls()
     {
+        if (!weatherEnabled_) return; // master toggle hides both weather windows
         ImGui::SetNextWindowPos(ImVec2(712, 18), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(346, 430), ImGuiCond_FirstUseEver);
         ImGui::Begin("Weather");
@@ -1991,14 +2120,16 @@ private:
 
     void drawWeatherOverlay()
     {
-        if (!weather_.ready()) return;
+        if (!weatherEnabled_ || !weather_.ready()) return;
         glm::mat4 viewProj = sceneProj() * camera_.view();
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
         int nx = weather_.nx(), ny = weather_.ny(), nz = weather_.nz();
         WeatherField field = static_cast<WeatherField>(weatherField_);
 
         // --- legacy billboard splat clouds (used only when the GPU ray-march is off) ---
-        if (showClouds_ && !cloudVolumetric_) {
+        // The maxQc/maxQr gates skip the full-grid scans (hundreds of thousands of cells
+        // per frame) when the snapshot provably contains nothing above draw threshold.
+        if (showClouds_ && !cloudVolumetric_ && weather_.viewMaxQc() > 2.0e-5f) {
             float dxz = kTerrainWorldSize / static_cast<float>(nx);
             struct Puff { float depth; ImVec2 sc; float sz; float a; };
             static std::vector<Puff> puffs;
@@ -2028,7 +2159,7 @@ private:
         }
 
         // --- rain streaks ---
-        if (showRain_) {
+        if (showRain_ && weather_.viewMaxQr() > 6.0e-5f) {
             int drawn = 0;
             for (int k = 0; k < nz && drawn < 9000; ++k)
                 for (int j = 0; j < ny; ++j)
@@ -2135,6 +2266,53 @@ private:
     {
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         checkVk(vkBeginCommandBuffer(commandBuffer, &begin), "Failed to begin command buffer");
+        // Pending staging -> texture copies (cloud field / terrain heightmap), done before
+        // the render pass so this frame samples the fresh data.
+        auto stageImageCopy = [&](VkBuffer src, VkImage img, VkImageLayout oldLayout, VkExtent3D extent) {
+            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            barrier.oldLayout = oldLayout;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = img;
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            // srcStage FRAGMENT_SHADER: an earlier in-flight frame may still be sampling.
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = extent;
+            vkCmdCopyBufferToImage(commandBuffer, src, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        };
+        if (cloudUploadPending_[currentFrame_] && weather_.ready()) {
+            // First copy fills the whole (zero-staged) texture so every texel has a defined
+            // value; after that only the active grid sub-region is refreshed, and UNDEFINED
+            // (which would discard the rest) is no longer used as the source layout.
+            bool first = !cloudImageInit_[currentFrame_];
+            VkExtent3D extent = first
+                ? VkExtent3D{kCloudTexX, kCloudTexY, kCloudTexZ}
+                : VkExtent3D{static_cast<std::uint32_t>(weather_.nx()),
+                             static_cast<std::uint32_t>(weather_.ny()),
+                             static_cast<std::uint32_t>(weather_.nz())};
+            stageImageCopy(cloudFieldStaging_[currentFrame_], cloudFieldImages_[currentFrame_],
+                           first ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, extent);
+            cloudImageInit_[currentFrame_] = true;
+            cloudUploadPending_[currentFrame_] = false;
+        }
+        if (cloudHeightUploadPending_) {
+            // Full overwrite every time, so discarding via UNDEFINED is always safe.
+            stageImageCopy(cloudHeightStaging_, cloudHeightImage_, VK_IMAGE_LAYOUT_UNDEFINED,
+                           {kCloudHeightRes, kCloudHeightRes, 1});
+            cloudHeightUploadPending_ = false;
+        }
         std::array<VkClearValue, 2> clears{};
         clears[0].color = {{0.30f, 0.42f, 0.52f, 1.0f}};
         clears[1].depthStencil = {1.0f, 0};
@@ -2168,7 +2346,11 @@ private:
         }
         // Volumetric clouds: fullscreen ray-march after terrain (reads terrain heightmap for
         // occlusion), before the ImGui overlay. Premultiplied-alpha blended over the scene.
-        if (cloudVolumetric_ && showClouds_ && weather_.ready()) {
+        // Skipped entirely when the field can't produce any density (maxQc*scale below the
+        // coverage floor) — otherwise a completely clear sky still pays ~50 ray steps of
+        // storage-buffer reads per pixel for an invisible pass.
+        if (weatherEnabled_ && cloudVolumetric_ && showClouds_ && weather_.ready()
+            && weather_.viewMaxQc() * cloudDensity_ > cloudCoverage_) {
             vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, cloudPipeline_);
             vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, cloudPipelineLayout_, 0, 1, &cloudSets_[currentFrame_], 0, nullptr);
             vkCmdDraw(commandBuffer, 3, 1, 0, 0);
@@ -2262,11 +2444,18 @@ private:
             vkFreeMemory(device_, uniformMemories_[i], nullptr);
         }
         for (int i = 0; i < kMaxFramesInFlight; ++i) {
-            if (cloudFieldBuffers_[i]) vkDestroyBuffer(device_, cloudFieldBuffers_[i], nullptr);
-            if (cloudFieldMemories_[i]) vkFreeMemory(device_, cloudFieldMemories_[i], nullptr);
+            if (cloudFieldViews_[i]) vkDestroyImageView(device_, cloudFieldViews_[i], nullptr);
+            if (cloudFieldImages_[i]) vkDestroyImage(device_, cloudFieldImages_[i], nullptr);
+            if (cloudFieldImageMemories_[i]) vkFreeMemory(device_, cloudFieldImageMemories_[i], nullptr);
+            if (cloudFieldStaging_[i]) vkDestroyBuffer(device_, cloudFieldStaging_[i], nullptr);
+            if (cloudFieldStagingMemories_[i]) vkFreeMemory(device_, cloudFieldStagingMemories_[i], nullptr);
         }
-        if (cloudHeightBuffer_) vkDestroyBuffer(device_, cloudHeightBuffer_, nullptr);
-        if (cloudHeightMemory_) vkFreeMemory(device_, cloudHeightMemory_, nullptr);
+        if (cloudHeightView_) vkDestroyImageView(device_, cloudHeightView_, nullptr);
+        if (cloudHeightImage_) vkDestroyImage(device_, cloudHeightImage_, nullptr);
+        if (cloudHeightImageMemory_) vkFreeMemory(device_, cloudHeightImageMemory_, nullptr);
+        if (cloudHeightStaging_) vkDestroyBuffer(device_, cloudHeightStaging_, nullptr);
+        if (cloudHeightStagingMemory_) vkFreeMemory(device_, cloudHeightStagingMemory_, nullptr);
+        if (cloudSampler_) vkDestroySampler(device_, cloudSampler_, nullptr);
         vkDestroyDescriptorPool(device_, imguiPool_, nullptr);
         vkDestroyDescriptorPool(device_, cloudPool_, nullptr);
         vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);

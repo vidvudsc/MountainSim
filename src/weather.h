@@ -207,13 +207,10 @@ public:
     {
         return {-kTerrainWorldSize * 0.5f + (i + 0.5f) * dx_, cellY(j), -kTerrainWorldSize * 0.5f + (k + 0.5f) * dz_};
     }
-    // Copy the currently-viewed cloud-water field (immutable snapshot) into dst, which must
-    // hold at least nx*ny*nz floats. Used to upload the volume to the GPU each frame.
-    void copyCloudField(float* dst) const
-    {
-        const std::vector<float>& q = aQc();
-        std::memcpy(dst, q.data(), q.size() * sizeof(float));
-    }
+    // Cloud-water field of the currently-viewed snapshot (immutable; the shared_ptr held
+    // by viewSnap_ keeps it alive). The renderer converts it straight into its staging
+    // buffer, so no intermediate float copy is needed.
+    const std::vector<float>& viewQc() const { return aQc(); }
     bool isSolid(int i, int j, int k) const { return solid_[idx(i, j, k)] != 0u; }
     int surfaceCell(int i, int k) const { return surfaceJ_[static_cast<std::size_t>(k) * nx_ + i]; }
     glm::vec3 velocity(int i, int j, int k) const { int c = idx(i, j, k); return {aU()[c], aV()[c], aW()[c]}; }
@@ -221,6 +218,13 @@ public:
     float rainAt(int i, int j, int k) const { return aQr()[idx(i, j, k)]; }
     float lightningAt(int i, int k) const { return aLightning()[static_cast<std::size_t>(k) * nx_ + i]; }
     float lightningFlash() const { return viewSnap_ ? viewSnap_->lightningFlash : lightningFlash_; }
+    // Identity of the snapshot the renderer is currently viewing. Changes only when the
+    // solver publishes a new step (or the scrubber picks another frame), so the renderer
+    // can skip re-uploading/rebuilding anything derived from an unchanged snapshot.
+    std::uint64_t viewToken() const { return viewSnap_ ? viewSnap_->id : 0; }
+    // Snapshot-wide maxima; 1.0 (i.e. "assume non-empty") when no snapshot exists yet.
+    float viewMaxQc() const { return viewSnap_ ? viewSnap_->maxQc : 1.0f; }
+    float viewMaxQr() const { return viewSnap_ ? viewSnap_->maxQr : 1.0f; }
 
     // ---- history / scrubber (render thread) ----------------------------------------------
     int historyCount() const
@@ -329,11 +333,14 @@ private:
         std::vector<float> lightning;
         float lightningFlash = 0.0f;
         float simTime = 0.0f;
+        std::uint64_t id = 0;                 // monotonic publish counter (never reused, unlike pointers)
+        float maxQc = 0.0f, maxQr = 0.0f;     // field maxima so the renderer can skip empty passes
     };
     std::deque<std::shared_ptr<const Snapshot>> history_;
     std::shared_ptr<const Snapshot> viewSnap_; // render thread: current snapshot to read
     bool viewingLive_ = true;
     int maxHistory_ = 120;
+    mutable std::uint64_t snapId_ = 0; // guarded by stepMtx_ (makeSnapshot callers hold it)
 
     // Persistent worker pool for parallelFor. The old implementation spawned and joined
     // a fresh set of std::threads on EVERY parallelFor call; with ~60 calls per step
@@ -380,6 +387,9 @@ private:
         s->lightning = lightning_;
         s->lightningFlash = lightningFlash_;
         s->simTime = simTime_;
+        s->id = ++snapId_;
+        s->maxQc = qc_.empty() ? 0.0f : *std::max_element(qc_.begin(), qc_.end());
+        s->maxQr = qr_.empty() ? 0.0f : *std::max_element(qr_.begin(), qr_.end());
         return s;
     }
 
@@ -420,6 +430,15 @@ private:
                 history_.push_back(snap);
                 while (static_cast<int>(history_.size()) > maxHistory_) history_.pop_front();
             }
+            // Cap the solver cadence at ~30 steps/s. Stepping is realDt-based, so the sim
+            // advances at the same speed either way; free-running just pegs every core to
+            // publish sub-frame snapshots the renderer can't consume anyway (it reads at
+            // most one per display refresh). Large grids that already take >33 ms/step
+            // are unaffected.
+            constexpr float kMinStepPeriod = 1.0f / 30.0f;
+            float took = std::chrono::duration<float>(clock::now() - now).count();
+            if (took < kMinStepPeriod)
+                std::this_thread::sleep_for(std::chrono::duration<float>(kMinStepPeriod - took));
         }
     }
 
