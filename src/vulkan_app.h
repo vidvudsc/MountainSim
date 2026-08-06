@@ -74,6 +74,17 @@ private:
     VkDeviceMemory skyboxMemory_ = VK_NULL_HANDLE;
     VkImageView skyboxView_ = VK_NULL_HANDLE;
     VkSampler skyboxSampler_ = VK_NULL_HANDLE;
+    // --- terrain material textures: photo-based (Poly Haven CC0) albedo + normal 2D
+    //     arrays, mipmapped, layer order = grass, rock, scree, snow, forest ---
+    static constexpr std::uint32_t kMatLayers = 5;
+    VkImage matAlbedoImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory matAlbedoMemory_ = VK_NULL_HANDLE;
+    VkImageView matAlbedoView_ = VK_NULL_HANDLE;
+    VkImage matNormalImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory matNormalMemory_ = VK_NULL_HANDLE;
+    VkImageView matNormalView_ = VK_NULL_HANDLE;
+    VkSampler matSampler_ = VK_NULL_HANDLE;
+    float texScale_ = 14.0f; // world units per texture repeat
     std::vector<VkFramebuffer> framebuffers_;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_;
@@ -235,6 +246,7 @@ private:
         createFramebuffers();
         createCommandPool();
         createSkyboxResources();
+        createTerrainTextures();
         createTerrainBuffers();
         createUniformBuffers();
         createCloudResources();
@@ -383,6 +395,7 @@ private:
         const std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME, "VK_KHR_portability_subset"};
         VkPhysicalDeviceFeatures features{};
         features.fillModeNonSolid = VK_TRUE;
+        features.samplerAnisotropy = VK_TRUE; // terrain material textures at grazing angles
         VkDeviceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         createInfo.queueCreateInfoCount = static_cast<std::uint32_t>(queues.size());
@@ -557,7 +570,18 @@ private:
         heightMap.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         heightMap.descriptorCount = 1;
         heightMap.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        std::array<VkDescriptorSetLayoutBinding, 4> bindings{ubo, skybox, cloudVol, heightMap};
+        // Terrain material albedo/normal 2D arrays.
+        VkDescriptorSetLayoutBinding matAlb{};
+        matAlb.binding = 4;
+        matAlb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        matAlb.descriptorCount = 1;
+        matAlb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutBinding matNor{};
+        matNor.binding = 5;
+        matNor.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        matNor.descriptorCount = 1;
+        matNor.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        std::array<VkDescriptorSetLayoutBinding, 6> bindings{ubo, skybox, cloudVol, heightMap, matAlb, matNor};
         VkDescriptorSetLayoutCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         createInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
@@ -1359,6 +1383,142 @@ private:
         checkVk(vkCreateSampler(device_, &sampler, nullptr, &skyboxSampler_), "Failed to create skybox sampler");
     }
 
+    // Build one mipmapped 2D-array texture from per-layer image files. Missing or
+    // mismatched files fall back to a neutral layer (grey albedo / flat normal) so the
+    // app runs even without the downloaded assets.
+    void createMaterialArray(const std::array<std::string, kMatLayers>& paths, VkFormat format, bool isNormal,
+                             VkImage& image, VkDeviceMemory& memory, VkImageView& view)
+    {
+        int W = 0, H = 0;
+        std::array<stbi_uc*, kMatLayers> data{};
+        for (std::uint32_t i = 0; i < kMatLayers; ++i) {
+            int w = 0, h = 0, c = 0;
+            data[i] = stbi_load(paths[i].c_str(), &w, &h, &c, STBI_rgb_alpha);
+            if (data[i] && W == 0) { W = w; H = h; }
+            if (data[i] && (w != W || h != H)) { stbi_image_free(data[i]); data[i] = nullptr; }
+            if (!data[i]) std::cout << "Terrain texture missing/mismatched, using neutral: " << paths[i] << "\n";
+        }
+        if (W == 0) { W = 4; H = 4; }
+
+        VkDeviceSize layerBytes = static_cast<VkDeviceSize>(W) * H * 4;
+        VkBuffer staging = VK_NULL_HANDLE;
+        VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+        createBuffer(layerBytes * kMatLayers, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMemory);
+        void* mapped = nullptr;
+        vkMapMemory(device_, stagingMemory, 0, layerBytes * kMatLayers, 0, &mapped);
+        for (std::uint32_t i = 0; i < kMatLayers; ++i) {
+            auto* dst = static_cast<stbi_uc*>(mapped) + layerBytes * i;
+            if (data[i]) {
+                std::memcpy(dst, data[i], layerBytes);
+                stbi_image_free(data[i]);
+            } else {
+                stbi_uc neutral[4] = {140, 140, 140, 255};
+                if (isNormal) { neutral[0] = 128; neutral[1] = 128; neutral[2] = 255; }
+                for (VkDeviceSize p = 0; p < layerBytes; p += 4) std::memcpy(dst + p, neutral, 4);
+            }
+        }
+        vkUnmapMemory(device_, stagingMemory);
+
+        std::uint32_t mips = 1 + static_cast<std::uint32_t>(std::floor(std::log2(std::max(W, H))));
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.extent = {static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(H), 1};
+        ii.mipLevels = mips;
+        ii.arrayLayers = kMatLayers;
+        ii.format = format;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        checkVk(vkCreateImage(device_, &ii, nullptr, &image), "Failed to create material array image");
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(device_, image, &req);
+        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        checkVk(vkAllocateMemory(device_, &alloc, nullptr, &memory), "Failed to allocate material array memory");
+        vkBindImageMemory(device_, image, memory, 0);
+
+        VkCommandBuffer cmd = beginSingleTimeCommands();
+        auto barrier = [&](std::uint32_t baseMip, std::uint32_t mipCount,
+                           VkImageLayout oldL, VkImageLayout newL,
+                           VkAccessFlags srcA, VkAccessFlags dstA,
+                           VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = oldL; b.newLayout = newL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = image;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, baseMip, mipCount, 0, kMatLayers};
+            b.srcAccessMask = srcA; b.dstAccessMask = dstA;
+            vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+        };
+        barrier(0, mips, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, kMatLayers};
+        region.imageExtent = {static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(H), 1};
+        vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        int mipW = W, mipH = H;
+        for (std::uint32_t i = 1; i < mips; ++i) {
+            barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, kMatLayers};
+            blit.srcOffsets[1] = {mipW, mipH, 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, kMatLayers};
+            blit.dstOffsets[1] = {std::max(mipW / 2, 1), std::max(mipH / 2, 1), 1};
+            vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+            barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            mipW = std::max(mipW / 2, 1);
+            mipH = std::max(mipH / 2, 1);
+        }
+        barrier(mips - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        endSingleTimeCommands(cmd);
+        vkDestroyBuffer(device_, staging, nullptr);
+        vkFreeMemory(device_, stagingMemory, nullptr);
+
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        vi.format = format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, kMatLayers};
+        checkVk(vkCreateImageView(device_, &vi, nullptr, &view), "Failed to create material array view");
+    }
+
+    void createTerrainTextures()
+    {
+        const std::array<std::string, kMatLayers> names{
+            "aerial_grass_rock", "rock_face", "aerial_rocks_02", "snow_02", "forest_ground_04"};
+        std::array<std::string, kMatLayers> diff{}, nor{};
+        for (std::uint32_t i = 0; i < kMatLayers; ++i) {
+            diff[i] = "assets/textures/" + names[i] + "_diff.jpg";
+            nor[i] = "assets/textures/" + names[i] + "_nor_gl.jpg";
+        }
+        createMaterialArray(diff, VK_FORMAT_R8G8B8A8_SRGB, false, matAlbedoImage_, matAlbedoMemory_, matAlbedoView_);
+        createMaterialArray(nor, VK_FORMAT_R8G8B8A8_UNORM, true, matNormalImage_, matNormalMemory_, matNormalView_);
+
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = VK_FILTER_LINEAR;
+        si.minFilter = VK_FILTER_LINEAR;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.anisotropyEnable = VK_TRUE;
+        si.maxAnisotropy = 8.0f;
+        si.maxLod = VK_LOD_CLAMP_NONE;
+        checkVk(vkCreateSampler(device_, &si, nullptr, &matSampler_), "Failed to create material sampler");
+    }
+
     void createDepthResources()
     {
         createImage(swapchainExtent_.width, swapchainExtent_.height, VK_FORMAT_D32_SFLOAT,
@@ -1471,7 +1631,7 @@ private:
     {
         std::array<VkDescriptorPoolSize, 2> poolSizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * kMaxFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 * kMaxFramesInFlight},
         }};
         VkDescriptorPoolCreateInfo createInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         createInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
@@ -1497,7 +1657,9 @@ private:
             imageInfo.sampler = skyboxSampler_;
             VkDescriptorImageInfo cloudInfo{cloudSampler_, cloudFieldViews_[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkDescriptorImageInfo hgtInfo{cloudSampler_, cloudHeightView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            std::array<VkWriteDescriptorSet, 4> writes{};
+            VkDescriptorImageInfo albInfo{matSampler_, matAlbedoView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkDescriptorImageInfo norInfo{matSampler_, matNormalView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            std::array<VkWriteDescriptorSet, 6> writes{};
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = descriptorSets_[i];
             writes[0].dstBinding = 0;
@@ -1522,6 +1684,18 @@ private:
             writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[3].descriptorCount = 1;
             writes[3].pImageInfo = &hgtInfo;
+            writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[4].dstSet = descriptorSets_[i];
+            writes[4].dstBinding = 4;
+            writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[4].descriptorCount = 1;
+            writes[4].pImageInfo = &albInfo;
+            writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[5].dstSet = descriptorSets_[i];
+            writes[5].dstBinding = 5;
+            writes[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[5].descriptorCount = 1;
+            writes[5].pImageInfo = &norInfo;
             vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
     }
@@ -1746,7 +1920,7 @@ private:
         ubo.lightning = (weatherEnabled_ && showLightning_) ? weather_.lightningLight() : glm::vec4(0.0f);
         bool anyCloud = weatherEnabled_ && weather_.ready() && weather_.viewMaxQc() > 2.0e-5f;
         ubo.shadowParams = glm::vec4(sunShadows_ ? 1.0f : 0.0f,
-                                     (cloudShadows_ && anyCloud) ? 1.0f : 0.0f, moonPhase_, 0.0f);
+                                     (cloudShadows_ && anyCloud) ? 1.0f : 0.0f, moonPhase_, texScale_);
         void* data = nullptr;
         vkMapMemory(device_, uniformMemories_[frame], 0, sizeof(ubo), 0, &data);
         std::memcpy(data, &ubo, sizeof(ubo));
@@ -1830,6 +2004,7 @@ private:
         ImGui::Checkbox("Sun shadows", &sunShadows_);
         ImGui::SameLine();
         ImGui::Checkbox("Cloud shadows", &cloudShadows_);
+        ImGui::SliderFloat("Texture scale", &texScale_, 6.0f, 30.0f, "%.0f m/repeat");
 
         ImGui::SeparatorText("Weather");
         ImGui::Checkbox("Enable weather", &weatherEnabled_);
@@ -2584,6 +2759,13 @@ private:
         vkDestroyImageView(device_, skyboxView_, nullptr);
         vkDestroyImage(device_, skyboxImage_, nullptr);
         vkFreeMemory(device_, skyboxMemory_, nullptr);
+        if (matSampler_) vkDestroySampler(device_, matSampler_, nullptr);
+        if (matAlbedoView_) vkDestroyImageView(device_, matAlbedoView_, nullptr);
+        if (matAlbedoImage_) vkDestroyImage(device_, matAlbedoImage_, nullptr);
+        if (matAlbedoMemory_) vkFreeMemory(device_, matAlbedoMemory_, nullptr);
+        if (matNormalView_) vkDestroyImageView(device_, matNormalView_, nullptr);
+        if (matNormalImage_) vkDestroyImage(device_, matNormalImage_, nullptr);
+        if (matNormalMemory_) vkFreeMemory(device_, matNormalMemory_, nullptr);
         cleanupSwapchain();
         vkDestroyPipeline(device_, slicePipeline_, nullptr);
         for (int i = 0; i < kMaxFramesInFlight; ++i) {

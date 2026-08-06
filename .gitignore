@@ -3,6 +3,10 @@ downloads/
 imgui.ini
 .DS_Store
 .cache/
-# Large unused PBR texture packs (renderer uses procedural colors); keep out of the repo.
-assets/textures/
+# Keep stray texture experiments out of the repo, but track the material set the
+# renderer actually samples (Poly Haven CC0 *_diff/*_nor_gl) plus its license.
+assets/textures/*
+!assets/textures/LICENSE.txt
+!assets/textures/*_diff.jpg
+!assets/textures/*_nor_gl.jpg
 .codex/

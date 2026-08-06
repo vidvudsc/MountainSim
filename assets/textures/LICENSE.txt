@@ -1,0 +1,5 @@
+Textures from ambientCG.com (Grass001, Rock030, Snow006, Gravel022), 1K JPG.
+Licensed under CC0 1.0 Universal (public domain). https://ambientcg.com
+
+Textures from polyhaven.com (aerial_grass_rock, rock_face, aerial_rocks_02, snow_02, forest_ground_04), 2K JPG diffuse + GL normal.
+Licensed under CC0 1.0 Universal (public domain). https://polyhaven.com

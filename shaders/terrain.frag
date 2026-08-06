@@ -28,8 +28,13 @@ layout(set = 0, binding = 0) uniform SceneUniforms {
 // Shared with the cloud pass: cloud water volume + terrain height, for shadow marches.
 layout(set = 0, binding = 2) uniform sampler3D cloudTex;
 layout(set = 0, binding = 3) uniform sampler2D heightTex;
+// Photo-based material arrays: layer 0 grass, 1 rock face, 2 scree, 3 snow, 4 forest.
+layout(set = 0, binding = 4) uniform sampler2DArray matAlbedo;
+layout(set = 0, binding = 5) uniform sampler2DArray matNormal;
 
 layout(location = 0) out vec4 outColor;
+
+float texLuma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
 const float WS = 165.0;                       // kTerrainWorldSize
 const vec3 TEXDIM = vec3(144.0, 96.0, 144.0); // allocated cloud texture extent
@@ -166,13 +171,62 @@ void main()
     float snowMask = clamp(vSurface.y, 0.0, 1.0);
     float iceMask = clamp(vSurface.z, 0.0, 1.0);
     float surfaceTempC = vSurface.w;
+    float sedimentMask = smoothstep(1.5, 2.5, materialId) * (1.0 - smoothstep(2.5, 3.5, materialId));
+    // Valley forest band: low, gentle, snow-free ground reads as conifer cover.
+    float forestW = smoothstep(0.26, 0.10, height01) * smoothstep(0.42, 0.20, slope) * (1.0 - snowMask);
+
+    // ---- photo material detail -----------------------------------------------------
+    // The procedural colors above stay in charge of the palette; the textures supply
+    // photographic structure (albedo detail + normal-map relief) modulated on top.
+    float texScale = max(u.shadowParams.w, 1.0);
+    vec2 uvG = p / texScale;
+    vec3 nGeom = n;
+    vec3 an = abs(nGeom);
+    float camDist = length(u.cameraPos.xyz - vWorldPos);
+
+    vec3 grassT = texture(matAlbedo, vec3(uvG, 0.0)).rgb;
+    // anti-tiling: second scale blended by the broad noise so repeats never line up
+    grassT = mix(grassT, texture(matAlbedo, vec3(uvG * 0.27, 0.0)).rgb, smoothstep(0.30, 0.70, broad));
+    vec3 screeT = texture(matAlbedo, vec3(uvG * 1.4, 2.0)).rgb;
+    vec3 snowT = texture(matAlbedo, vec3(uvG * 1.1, 3.0)).rgb;
+    vec3 forestT = texture(matAlbedo, vec3(uvG * 0.8, 4.0)).rgb;
+    // cliff rock: triplanar side projection so faces get vertical structure
+    vec2 uvZY = vWorldPos.zy / texScale;
+    vec2 uvXY = vWorldPos.xy / texScale;
+    float sideW = an.x / max(an.x + an.z, 1e-4);
+    vec3 rockT = mix(texture(matAlbedo, vec3(uvXY, 1.0)).rgb, texture(matAlbedo, vec3(uvZY, 1.0)).rgb, sideW);
+    float topBlend = smoothstep(0.55, 0.85, nGeom.y);
+    rockT = mix(rockT, texture(matAlbedo, vec3(uvG, 1.0)).rgb, topBlend);
+
+    float screeW = max(alpineMask * 0.6, sedimentMask);
+    vec3 texDetail = grassT;
+    texDetail = mix(texDetail, forestT, forestW);
+    texDetail = mix(texDetail, screeT, screeW);
+    texDetail = mix(texDetail, rockT, rockMask);
+    texDetail = mix(texDetail, snowT, snowMask);
+    // structure mostly from luminance so the procedural palette keeps steering the hue
+    texDetail = mix(vec3(texLuma(texDetail)), texDetail, 0.45);
+
+    // matching normal-map relief (grass shared for forest; deltas per projection plane)
+    vec3 nmTop = texture(matNormal, vec3(uvG, 0.0)).xyz * 2.0 - 1.0;
+    nmTop = mix(nmTop, texture(matNormal, vec3(uvG * 1.4, 2.0)).xyz * 2.0 - 1.0, screeW);
+    nmTop = mix(nmTop, texture(matNormal, vec3(uvG * 1.1, 3.0)).xyz * 2.0 - 1.0, snowMask);
+    vec3 nmXY = texture(matNormal, vec3(uvXY, 1.0)).xyz * 2.0 - 1.0;
+    vec3 nmZY = texture(matNormal, vec3(uvZY, 1.0)).xyz * 2.0 - 1.0;
+    vec3 dTop = vec3(nmTop.x, 0.0, nmTop.y);
+    vec3 dSide = mix(vec3(nmXY.x, nmXY.y, 0.0), vec3(0.0, nmZY.y, nmZY.x), sideW);
+    vec3 dTotal = mix(dTop, dSide, rockMask * (1.0 - topBlend * 0.5));
+    // fade relief with distance so it never shimmers at the horizon
+    float nStr = 0.85 * clamp(80.0 / max(camDist, 1.0), 0.25, 1.0);
+    // ---------------------------------------------------------------------------------
 
     vec3 base = mix(grass, alpine, alpineMask);
     base = mix(base, rock, rockMask);
     base = mix(base, cliff, cliffMask);
-    base = mix(base, sediment, smoothstep(1.5, 2.5, materialId) * (1.0 - smoothstep(2.5, 3.5, materialId)));
+    base = mix(base, sediment, sedimentMask);
     base = mix(base, snow, snowMask);
     base = mix(base, vec3(0.70, 0.86, 0.96), iceMask * 0.72);
+    base = mix(base, base * vec3(0.52, 0.68, 0.52), forestW); // conifer-dark valleys
 
     float stratum = smoothstep(0.42, 0.58, noise(vec2(vWorldPos.y * 1.15, vUv.x * 8.0 + vUv.y * 5.0)));
     float layer = smoothstep(0.47, 0.53, sin(vWorldPos.y * 1.7 + broad * 2.8) * 0.5 + 0.5);
@@ -206,6 +260,16 @@ void main()
         vec3 channelColor = mix(washColor, vec3(0.44, 0.55, 0.57), smoothstep(0.78, 1.0, vHydro.x));
         base = mix(base, channelColor, wet * 0.54);
     }
+
+    // Cut faces are vertical: pure side-projected rock structure over the strata colors.
+    if (cutFace > 0.5) {
+        texDetail = mix(vec3(texLuma(rockT)), rockT, 0.35);
+        dTotal = dSide;
+    }
+    base = clamp(base * texDetail * 2.15, 0.0, 1.5);
+
+    // Apply the material relief to the shading normal.
+    n = normalize(nGeom + dTotal * nStr);
 
     float diff = max(dot(n, lightDir), 0.0);
     float rim = pow(max(1.0 - dot(n, viewDir), 0.0), 2.2);
@@ -241,8 +305,7 @@ void main()
     }
 
     // Fog with sun-tinted inscatter: haze glows warm when looking toward the sun.
-    float dist = length(u.cameraPos.xyz - vWorldPos);
-    float fog = fogDensity <= 0.00001 ? 0.0 : clamp(1.0 - exp(-dist * fogDensity), 0.0, 0.92);
+    float fog = fogDensity <= 0.00001 ? 0.0 : clamp(1.0 - exp(-camDist * fogDensity), 0.0, 0.92);
     float sunAmount = max(dot(-viewDir, lightDir), 0.0);
     vec3 fogCol = mix(u.fogColor.xyz, u.sunColor.xyz, 0.55 * pow(sunAmount, 6.0));
     color = mix(color, fogCol, fog);
