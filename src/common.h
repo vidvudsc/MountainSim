@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-constexpr int kTerrainSize = 193;
+constexpr int kTerrainSize = 385;
 constexpr float kTerrainWorldSize = 165.0f;
 constexpr int kMaxFramesInFlight = 2;
 

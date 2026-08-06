@@ -21,6 +21,10 @@ struct TerrainSettings {
     float persistence = 0.48f;
     float peakSharpness = 1.45f;
     float heightScale = 42.0f;
+    float ridged = 0.55f;       // 0 = billowy fbm hills, 1 = ridged-multifractal ranges
+    float warp = 0.38f;         // domain-warp strength: curves and interlocks the ridgelines
+    float talusAngle = 34.0f;   // thermal erosion angle of repose (degrees)
+    int thermalIters = 28;      // thermal relaxation passes at generation
     float snowLevel = 0.67f;
     float waterLevel = 0.10f;
     float waterTint = 1.10f;
@@ -31,8 +35,8 @@ struct TerrainSettings {
     float sunElevation = 34.0f;
     bool showWater = true;
     bool showSediment = true;
-    int erosionDrops = 18000;
-    float erosionRadius = 1.9f;
+    int erosionDrops = 30000;   // retuned for the 385 grid (was 18000 at 193)
+    float erosionRadius = 2.6f; // in grid cells; scaled up to keep a similar world radius
     float inertia = 0.18f;
     float capacity = 3.6f;
     float minCapacity = 0.02f;
@@ -74,33 +78,64 @@ public:
         liveDroplets_.clear();
         particlePositions_.clear();
 
+        auto fbm = [&](glm::vec2 q, int octaves, float baseFrequency, float persistence) {
+            float amp = 1.0f;
+            float freq = baseFrequency;
+            float sum = 0.0f;
+            float norm = 0.0f;
+            for (int o = 0; o < octaves; ++o) {
+                sum += perlin.noise(q.x * freq, q.y * freq) * amp;
+                norm += amp;
+                amp *= persistence;
+                freq *= settings.lacunarity;
+            }
+            return sum / std::max(norm, 0.001f) * 0.5f + 0.5f;
+        };
+        // Ridged multifractal: |noise| folded into sharp creases, higher octaves gated by
+        // the local ridge value so detail accumulates on ridges instead of everywhere.
+        // This is what makes connected ridgelines, spurs and V-valleys instead of blobs.
+        auto ridged = [&](glm::vec2 q, int octaves, float baseFrequency) {
+            float amp = 0.5f;
+            float freq = baseFrequency;
+            float sum = 0.0f;
+            float norm = 0.0f;
+            float weight = 1.0f;
+            for (int o = 0; o < octaves; ++o) {
+                float n = perlin.noise(q.x * freq, q.y * freq);
+                float r = 1.0f - std::fabs(n);
+                r = r * r * weight;
+                weight = glm::clamp(r * 1.9f, 0.0f, 1.0f);
+                sum += r * amp;
+                norm += amp;
+                amp *= settings.persistence;
+                freq *= settings.lacunarity;
+            }
+            return sum / std::max(norm, 0.001f);
+        };
+
         float minHeight = 1e9f;
         float maxHeight = -1e9f;
         for (int z = 0; z < kTerrainSize; ++z) {
             for (int x = 0; x < kTerrainSize; ++x) {
                 glm::vec2 uv(static_cast<float>(x) / (kTerrainSize - 1), static_cast<float>(z) / (kTerrainSize - 1));
                 glm::vec2 centered = uv * 2.0f - 1.0f;
-                auto fbm = [&](glm::vec2 q, int octaves, float baseFrequency, float persistence) {
-                    float amp = 1.0f;
-                    float freq = baseFrequency;
-                    float sum = 0.0f;
-                    float norm = 0.0f;
-                    for (int o = 0; o < octaves; ++o) {
-                        sum += perlin.noise(q.x * freq, q.y * freq) * amp;
-                        norm += amp;
-                        amp *= persistence;
-                        freq *= settings.lacunarity;
-                    }
-                    return sum / std::max(norm, 0.001f) * 0.5f + 0.5f;
-                };
+                // Domain warp: bend the sample space with low-frequency noise so ridges
+                // curve and interlock the way real orogeny does.
+                glm::vec2 warpOff(
+                    fbm(centered * 1.25f + glm::vec2(23.7f, 8.2f), 4, 1.05f, 0.55f) - 0.5f,
+                    fbm(centered * 1.25f + glm::vec2(-14.1f, 27.3f), 4, 1.05f, 0.55f) - 0.5f);
+                glm::vec2 wp = centered + settings.warp * 2.0f * warpOff;
 
-                float base = fbm(centered + glm::vec2(4.2f, -8.7f), settings.octaves, settings.frequency, settings.persistence);
-                float detail = fbm(centered + glm::vec2(-11.4f, 5.9f), std::max(3, settings.octaves - 2), settings.frequency * 3.4f, settings.persistence * 0.82f);
-                float micro = fbm(centered + glm::vec2(19.1f, 13.3f), 3, settings.frequency * 11.0f, settings.persistence * 0.55f);
+                float base = fbm(wp + glm::vec2(4.2f, -8.7f), settings.octaves, settings.frequency, settings.persistence);
+                float ridge = ridged(wp * 0.92f + glm::vec2(7.7f, -3.1f), settings.octaves, settings.frequency * 0.85f);
+                float detail = fbm(wp + glm::vec2(-11.4f, 5.9f), std::max(3, settings.octaves - 2), settings.frequency * 3.4f, settings.persistence * 0.82f);
+                float micro = fbm(wp + glm::vec2(19.1f, 13.3f), 3, settings.frequency * 11.0f, settings.persistence * 0.55f);
                 float massif = fbm(centered + glm::vec2(31.0f, -17.0f), 3, 0.78f, 0.58f);
                 float islandMask = smoothstep01(1.13f - glm::length(centered * glm::vec2(0.92f, 1.05f)) * 0.52f);
                 float mountainMask = smoothstep01((massif - 0.30f) / 0.48f);
-                float h = base * 0.72f + detail * 0.22f + micro * 0.06f;
+                float soft = base * 0.72f + detail * 0.22f + micro * 0.06f;
+                float sharp = ridge * 0.80f + detail * 0.14f + micro * 0.06f;
+                float h = glm::mix(soft, sharp, glm::clamp(settings.ridged, 0.0f, 1.0f));
                 h = std::pow(glm::clamp(h, 0.0f, 1.0f), settings.peakSharpness);
                 h *= glm::mix(0.42f, 1.18f, mountainMask) * islandMask;
                 heights_[idx(x, z)] = h;
@@ -112,9 +147,45 @@ public:
             h = (h - minHeight) / std::max(maxHeight - minHeight, 0.001f);
             h = h * settings.heightScale;
         }
+        thermalErode(settings.thermalIters, settings.talusAngle, 0.30f);
         smoothHeightmap(1, 0.08f);
         rebuildSurfaceState();
         rebuildVertices();
+    }
+
+    // Thermal erosion: material above the angle of repose slumps to the neighbour below,
+    // turning noise-sharp cliffs into scree aprons and consistent talus slopes.
+    void thermalErode(int iterations, float talusAngleDeg, float rate)
+    {
+        if (iterations <= 0) return;
+        float cell = kTerrainWorldSize / static_cast<float>(kTerrainSize - 1);
+        float maxDiff = std::tan(glm::radians(glm::clamp(talusAngleDeg, 10.0f, 60.0f))) * cell;
+        // pair each cell with its E, S, SE, SW neighbours so every edge is visited once
+        static constexpr int kNb[4][2] = {{1, 0}, {0, 1}, {1, 1}, {-1, 1}};
+        std::vector<float> delta(heights_.size());
+        for (int it = 0; it < iterations; ++it) {
+            std::fill(delta.begin(), delta.end(), 0.0f);
+            for (int z = 0; z < kTerrainSize - 1; ++z) {
+                for (int x = 1; x < kTerrainSize - 1; ++x) {
+                    int c = idx(x, z);
+                    for (const auto& nb : kNb) {
+                        int n = idx(x + nb[0], z + nb[1]);
+                        float lim = maxDiff * ((nb[0] != 0 && nb[1] != 0) ? 1.41421f : 1.0f);
+                        float d = heights_[c] - heights_[n];
+                        if (d > lim) {
+                            float move = rate * (d - lim) * 0.5f;
+                            delta[c] -= move;
+                            delta[n] += move;
+                        } else if (-d > lim) {
+                            float move = rate * (-d - lim) * 0.5f;
+                            delta[n] -= move;
+                            delta[c] += move;
+                        }
+                    }
+                }
+            }
+            for (std::size_t i = 0; i < heights_.size(); ++i) heights_[i] += delta[i];
+        }
     }
 
     void erode(int drops)
@@ -192,6 +263,9 @@ public:
     void finishErosionPass()
     {
         updateHydroDisplay();
+        // A few thermal passes after hydraulic carving: freshly gouged gully walls
+        // exceed the angle of repose and slump into natural-looking talus.
+        thermalErode(std::min(settings_.thermalIters, 10), settings_.talusAngle, 0.24f);
         smoothHeightmap(1, 0.028f);
         rebuildSurfaceState();
         rebuildVertices();
@@ -363,7 +437,12 @@ private:
                 int zu = std::min(kTerrainSize - 1, z + 1);
                 float sx = heights_[idx(xr, z)] - heights_[idx(xl, z)];
                 float sz = heights_[idx(x, zu)] - heights_[idx(x, zd)];
-                float slope = glm::clamp(glm::length(glm::vec2(sx, sz)) * 0.45f, 0.0f, 1.0f);
+                // Physical gradient (rise per world unit), so the material/snow slope
+                // thresholds keep meaning the same thing at any grid resolution. The
+                // 0.77 factor reproduces the tuning from the original 193 grid.
+                float stepWorld = kTerrainWorldSize / static_cast<float>(kTerrainSize - 1);
+                float grad = glm::length(glm::vec2(sx, sz)) / (2.0f * stepWorld);
+                float slope = glm::clamp(grad * 0.77f, 0.0f, 1.0f);
                 float height01 = glm::clamp(heights_[index] / maxH, 0.0f, 1.0f);
                 float sediment = (index < static_cast<int>(displaySediment_.size())) ? displaySediment_[index] : 0.0f;
                 float water = (index < static_cast<int>(displayWater_.size())) ? displayWater_[index] : 0.0f;

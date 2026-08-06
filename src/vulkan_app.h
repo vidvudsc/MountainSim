@@ -1778,6 +1778,10 @@ private:
         regenerate |= ImGui::SliderFloat("Persistence", &editable.persistence, 0.25f, 0.72f, "%.2f");
         regenerate |= ImGui::SliderFloat("Peak sharpness", &editable.peakSharpness, 0.80f, 2.60f, "%.2f");
         regenerate |= ImGui::SliderFloat("Height scale", &editable.heightScale, 12.0f, 78.0f, "%.1f");
+        regenerate |= ImGui::SliderFloat("Ridged", &editable.ridged, 0.0f, 1.0f, "%.2f");
+        regenerate |= ImGui::SliderFloat("Warp", &editable.warp, 0.0f, 1.0f, "%.2f");
+        regenerate |= ImGui::SliderFloat("Talus angle", &editable.talusAngle, 26.0f, 45.0f, "%.0f deg");
+        regenerate |= ImGui::SliderInt("Thermal passes", &editable.thermalIters, 0, 80);
         if (regenerate || ImGui::Button("Regenerate heightmap")) {
             erosionAnimating_ = false;
             terrain_.generate(editable);
