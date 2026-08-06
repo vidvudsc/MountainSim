@@ -1770,23 +1770,14 @@ private:
         ImGui::SetNextWindowPos(ImVec2(18, 18), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(330, 285), ImGuiCond_FirstUseEver);
         ImGui::Begin("Terrain");
-        // Generation now runs the full carve pipeline (~0.4 s), so regenerate when a
-        // control is released rather than on every drag tick.
         bool regenerate = false;
-        auto released = [&] { regenerate |= ImGui::IsItemDeactivatedAfterEdit(); };
-        ImGui::InputInt("Seed", &editable.seed); released();
-        ImGui::SliderInt("Octaves", &editable.octaves, 1, 10); released();
-        ImGui::SliderFloat("Noise frequency", &editable.frequency, 0.5f, 7.0f, "%.2f"); released();
-        ImGui::SliderFloat("Lacunarity", &editable.lacunarity, 1.4f, 3.2f, "%.2f"); released();
-        ImGui::SliderFloat("Persistence", &editable.persistence, 0.25f, 0.72f, "%.2f"); released();
-        ImGui::SliderFloat("Peak sharpness", &editable.peakSharpness, 0.80f, 2.60f, "%.2f"); released();
-        ImGui::SliderFloat("Height scale", &editable.heightScale, 12.0f, 78.0f, "%.1f"); released();
-        ImGui::SliderFloat("Ridged", &editable.ridged, 0.0f, 1.0f, "%.2f"); released();
-        ImGui::SliderFloat("Warp", &editable.warp, 0.0f, 1.0f, "%.2f"); released();
-        ImGui::SliderFloat("Fluvial carving", &editable.fluvial, 0.0f, 1.0f, "%.2f"); released();
-        ImGui::SliderInt("Carve drops", &editable.genDrops, 0, 120000); released();
-        ImGui::SliderFloat("Talus angle", &editable.talusAngle, 26.0f, 45.0f, "%.0f deg"); released();
-        ImGui::SliderInt("Thermal passes", &editable.thermalIters, 0, 80); released();
+        regenerate |= ImGui::InputInt("Seed", &editable.seed);
+        regenerate |= ImGui::SliderInt("Octaves", &editable.octaves, 1, 10);
+        regenerate |= ImGui::SliderFloat("Noise frequency", &editable.frequency, 0.5f, 7.0f, "%.2f");
+        regenerate |= ImGui::SliderFloat("Lacunarity", &editable.lacunarity, 1.4f, 3.2f, "%.2f");
+        regenerate |= ImGui::SliderFloat("Persistence", &editable.persistence, 0.25f, 0.72f, "%.2f");
+        regenerate |= ImGui::SliderFloat("Peak sharpness", &editable.peakSharpness, 0.80f, 2.60f, "%.2f");
+        regenerate |= ImGui::SliderFloat("Height scale", &editable.heightScale, 12.0f, 78.0f, "%.1f");
         if (regenerate || ImGui::Button("Regenerate heightmap")) {
             erosionAnimating_ = false;
             terrain_.generate(editable);
