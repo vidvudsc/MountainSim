@@ -5,6 +5,7 @@ layout(location = 1) in vec3 vNormal;
 layout(location = 2) in vec2 vUv;
 layout(location = 3) in vec2 vHydro;
 layout(location = 4) in float vHeight;
+layout(location = 5) in vec4 vSurface;
 
 layout(set = 0, binding = 0) uniform SceneUniforms {
     mat4 view;
@@ -53,7 +54,6 @@ float fbm(vec2 p)
 void main()
 {
     float heightScale = max(u.terrain.x, 0.001);
-    float snowLevel = u.terrain.y;
     float waterLevel = u.terrain.z;
     float fogDensity = u.terrain.w;
     float waterTint = u.effects.x;
@@ -90,13 +90,17 @@ void main()
     float rockMask = smoothstep(0.24, 0.58, slope);
     float cliffMask = smoothstep(0.48, 0.82, slope);
     float alpineMask = smoothstep(0.24, 0.52, height01);
-    float snowMask = smoothstep(snowLevel - 0.025, snowLevel + 0.075, height01)
-                   * (1.0 - smoothstep(0.58, 0.9, slope));
+    float materialId = vSurface.x;
+    float snowMask = clamp(vSurface.y, 0.0, 1.0);
+    float iceMask = clamp(vSurface.z, 0.0, 1.0);
+    float surfaceTempC = vSurface.w;
 
     vec3 base = mix(grass, alpine, alpineMask);
     base = mix(base, rock, rockMask);
     base = mix(base, cliff, cliffMask);
+    base = mix(base, sediment, smoothstep(1.5, 2.5, materialId) * (1.0 - smoothstep(2.5, 3.5, materialId)));
     base = mix(base, snow, snowMask);
+    base = mix(base, vec3(0.70, 0.86, 0.96), iceMask * 0.72);
 
     float stratum = smoothstep(0.42, 0.58, noise(vec2(vWorldPos.y * 1.15, vUv.x * 8.0 + vUv.y * 5.0)));
     float layer = smoothstep(0.47, 0.53, sin(vWorldPos.y * 1.7 + broad * 2.8) * 0.5 + 0.5);
@@ -129,7 +133,8 @@ void main()
 
     float diff = max(dot(n, lightDir), 0.0);
     float rim = pow(max(1.0 - dot(n, viewDir), 0.0), 2.2);
-    float spec = pow(max(dot(n, halfDir), 0.0), mix(22.0, 96.0, wet + snowMask * 0.5)) * (wet + snowMask * 0.10);
+    float coldSheen = smoothstep(2.0, -8.0, surfaceTempC) * (snowMask + iceMask);
+    float spec = pow(max(dot(n, halfDir), 0.0), mix(22.0, 112.0, wet + snowMask * 0.5 + iceMask)) * (wet + snowMask * 0.10 + iceMask * 0.45 + coldSheen * 0.08);
     float shade = mix(0.58, 1.0, smoothstep(-0.12, 0.36, dot(n, lightDir)));
 
     vec3 color = base * (vec3(0.15, 0.18, 0.20) + u.sunColor.xyz * diff * shade);

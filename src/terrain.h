@@ -26,6 +26,7 @@ struct TerrainSettings {
     float waterTint = 1.10f;
     float sedimentTint = 0.85f;
     float fogDensity = 0.0f;
+    float surfaceTempC = 8.0f;
     float sunAzimuth = 42.0f;
     float sunElevation = 34.0f;
     bool showWater = true;
@@ -39,6 +40,13 @@ struct TerrainSettings {
     float erodeSpeed = 0.16f;
     float evaporation = 0.035f;
     float gravity = 5.5f;
+};
+
+enum class TerrainMaterial : int {
+    Grass = 0,
+    Rock = 1,
+    Sediment = 2,
+    Water = 3,
 };
 
 class Terrain {
@@ -57,6 +65,11 @@ public:
         sediment_.assign(kTerrainSize * kTerrainSize, 0.0f);
         displayWater_.assign(kTerrainSize * kTerrainSize, 0.0f);
         displaySediment_.assign(kTerrainSize * kTerrainSize, 0.0f);
+        material_.assign(kTerrainSize * kTerrainSize, TerrainMaterial::Grass);
+        surfaceTempC_.assign(kTerrainSize * kTerrainSize, settings.surfaceTempC);
+        wetness_.assign(kTerrainSize * kTerrainSize, 0.0f);
+        snowMass_.assign(kTerrainSize * kTerrainSize, 0.0f);
+        iceMass_.assign(kTerrainSize * kTerrainSize, 0.0f);
         hasErosionFlow_ = false;
         liveDroplets_.clear();
         particlePositions_.clear();
@@ -100,6 +113,7 @@ public:
             h = h * settings.heightScale;
         }
         smoothHeightmap(1, 0.08f);
+        rebuildSurfaceState();
         rebuildVertices();
     }
 
@@ -179,6 +193,7 @@ public:
     {
         updateHydroDisplay();
         smoothHeightmap(1, 0.028f);
+        rebuildSurfaceState();
         rebuildVertices();
         hasErosionFlow_ = true;
     }
@@ -200,6 +215,7 @@ public:
     void smoothPeaks()
     {
         smoothHeightmap(1, 0.16f);
+        rebuildSurfaceState();
         rebuildVertices();
         particlePositions_.clear();
     }
@@ -325,6 +341,56 @@ private:
         if (x < 0.0f || x > static_cast<float>(kTerrainSize - 1) || z < 0.0f || z > static_cast<float>(kTerrainSize - 1)) return false;
         grid = {x, z};
         return true;
+    }
+
+    void rebuildSurfaceState()
+    {
+        if (material_.size() != heights_.size()) {
+            material_.assign(heights_.size(), TerrainMaterial::Grass);
+            surfaceTempC_.assign(heights_.size(), settings_.surfaceTempC);
+            wetness_.assign(heights_.size(), 0.0f);
+            snowMass_.assign(heights_.size(), 0.0f);
+            iceMass_.assign(heights_.size(), 0.0f);
+        }
+
+        float maxH = std::max(maxSurfaceHeight(), 0.001f);
+        for (int z = 0; z < kTerrainSize; ++z) {
+            for (int x = 0; x < kTerrainSize; ++x) {
+                int index = idx(x, z);
+                int xl = std::max(0, x - 1);
+                int xr = std::min(kTerrainSize - 1, x + 1);
+                int zd = std::max(0, z - 1);
+                int zu = std::min(kTerrainSize - 1, z + 1);
+                float sx = heights_[idx(xr, z)] - heights_[idx(xl, z)];
+                float sz = heights_[idx(x, zu)] - heights_[idx(x, zd)];
+                float slope = glm::clamp(glm::length(glm::vec2(sx, sz)) * 0.45f, 0.0f, 1.0f);
+                float height01 = glm::clamp(heights_[index] / maxH, 0.0f, 1.0f);
+                float sediment = (index < static_cast<int>(displaySediment_.size())) ? displaySediment_[index] : 0.0f;
+                float water = (index < static_cast<int>(displayWater_.size())) ? displayWater_[index] : 0.0f;
+
+                TerrainMaterial mat = TerrainMaterial::Grass;
+                if (water > 0.70f) mat = TerrainMaterial::Water;
+                else if (sediment > 0.42f) mat = TerrainMaterial::Sediment;
+                else if (slope > 0.46f || height01 > 0.54f) mat = TerrainMaterial::Rock;
+                material_[index] = mat;
+
+                wetness_[index] = glm::clamp(water * 0.85f + sediment * 0.25f, 0.0f, 1.0f);
+
+                // Temporary initial condition: altitude seeds snow mass so the existing
+                // mountain starts plausibly cold. Rendering no longer invents snow from
+                // altitude; future weather/energy steps should mutate this mass directly.
+                float coldAltitude = smoothstep01((height01 - settings_.snowLevel) / 0.10f);
+                float snow = coldAltitude * (1.0f - smoothstep01((slope - 0.58f) / 0.22f));
+                snowMass_[index] = glm::clamp(snow, 0.0f, 1.0f);
+                iceMass_[index] = glm::clamp(wetness_[index] * smoothstep01((height01 - settings_.snowLevel + 0.08f) / 0.12f) * 0.35f, 0.0f, 1.0f);
+
+                float materialOffset = 0.0f;
+                if (mat == TerrainMaterial::Rock) materialOffset = 1.5f;
+                else if (mat == TerrainMaterial::Water) materialOffset = -2.0f;
+                else if (mat == TerrainMaterial::Sediment) materialOffset = 0.5f;
+                surfaceTempC_[index] = settings_.surfaceTempC - height01 * 16.0f - snowMass_[index] * 7.0f - iceMass_[index] * 4.0f + materialOffset;
+            }
+        }
     }
 
     void appendSurfaceIndices()
@@ -512,6 +578,14 @@ private:
                 vertices_[index].position = gridToWorld(static_cast<float>(x), static_cast<float>(z), heights_[index]);
                 vertices_[index].uv = {static_cast<float>(x) / (kTerrainSize - 1), static_cast<float>(z) / (kTerrainSize - 1)};
                 vertices_[index].hydro = {displayWater_[index], displaySediment_[index]};
+                vertices_[index].surface = {
+                    static_cast<float>(material_[index] == TerrainMaterial::Grass ? 0 :
+                                       material_[index] == TerrainMaterial::Rock ? 1 :
+                                       material_[index] == TerrainMaterial::Sediment ? 2 : 3),
+                    snowMass_[index],
+                    iceMass_[index],
+                    surfaceTempC_[index]
+                };
             }
         }
         for (int z = 0; z < kTerrainSize; ++z) {
@@ -545,6 +619,7 @@ private:
             vertex.normal = normal;
             vertex.uv = {position.x / kTerrainWorldSize + 0.5f, position.z / kTerrainWorldSize + 0.5f};
             vertex.hydro = {-1.0f, 0.0f};
+            vertex.surface = {1.0f, 0.0f, 0.0f, settings_.surfaceTempC};
             return vertex;
         };
         vertices_.push_back(makeVertex(topA));
@@ -583,6 +658,7 @@ private:
             vertex.normal = {0.0f, -1.0f, 0.0f};
             vertex.uv = {position.x / kTerrainWorldSize + 0.5f, position.z / kTerrainWorldSize + 0.5f};
             vertex.hydro = {-2.0f, 0.0f};
+            vertex.surface = {1.0f, 0.0f, 0.0f, 8.0f};
             return vertex;
         };
         float half = kTerrainWorldSize * 0.5f;
@@ -599,6 +675,11 @@ private:
     std::vector<float> sediment_;
     std::vector<float> displayWater_;
     std::vector<float> displaySediment_;
+    std::vector<TerrainMaterial> material_;
+    std::vector<float> surfaceTempC_;
+    std::vector<float> wetness_;
+    std::vector<float> snowMass_;
+    std::vector<float> iceMass_;
     std::vector<Droplet> liveDroplets_;
     std::vector<glm::vec3> particlePositions_;
     bool hasErosionFlow_ = false;

@@ -4,6 +4,7 @@ layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUv;
 layout(location = 3) in vec2 inHydro;
+layout(location = 4) in vec4 inSurface;
 
 layout(set = 0, binding = 0) uniform SceneUniforms {
     mat4 view;
@@ -21,6 +22,7 @@ layout(location = 1) out vec3 vNormal;
 layout(location = 2) out vec2 vUv;
 layout(location = 3) out vec2 vHydro;
 layout(location = 4) out float vHeight;
+layout(location = 5) out vec4 vSurface;
 
 void main()
 {
@@ -29,6 +31,6 @@ void main()
     vUv = inUv;
     vHydro = inHydro;
     vHeight = inPosition.y;
+    vSurface = inSurface;
     gl_Position = u.proj * u.view * vec4(inPosition, 1.0);
 }
-

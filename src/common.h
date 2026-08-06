@@ -19,6 +19,10 @@ struct Vertex {
     glm::vec3 normal{0.0f, 1.0f, 0.0f};
     glm::vec2 uv{};
     glm::vec2 hydro{};
+    // x = base material id, y = snow mass display [0,1], z = ice mass display [0,1],
+    // w = surface temperature in C. The renderer uses this as the terrain's physical
+    // surface payload instead of inventing snow purely from altitude.
+    glm::vec4 surface{};
 };
 
 struct SceneUniforms {
