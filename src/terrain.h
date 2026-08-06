@@ -21,10 +21,12 @@ struct TerrainSettings {
     float persistence = 0.48f;
     float peakSharpness = 1.45f;
     float heightScale = 42.0f;
-    float ridged = 0.55f;       // 0 = billowy fbm hills, 1 = ridged-multifractal ranges
-    float warp = 0.38f;         // domain-warp strength: curves and interlocks the ridgelines
-    float talusAngle = 34.0f;   // thermal erosion angle of repose (degrees)
-    int thermalIters = 28;      // thermal relaxation passes at generation
+    float ridged = 0.72f;       // 0 = billowy fbm hills, 1 = ridged-multifractal ranges
+    float warp = 0.42f;         // domain-warp strength: curves and interlocks the ridgelines
+    float talusAngle = 36.0f;   // thermal erosion angle of repose (degrees)
+    int thermalIters = 14;      // thermal relaxation passes at generation
+    float fluvial = 0.65f;      // flow-accumulation stream carving strength at generation
+    int genDrops = 35000;       // droplet-erosion rill pass baked into generation
     float snowLevel = 0.67f;
     float waterLevel = 0.10f;
     float waterTint = 1.10f;
@@ -36,7 +38,7 @@ struct TerrainSettings {
     bool showWater = true;
     bool showSediment = true;
     int erosionDrops = 30000;   // retuned for the 385 grid (was 18000 at 193)
-    float erosionRadius = 2.6f; // in grid cells; scaled up to keep a similar world radius
+    float erosionRadius = 2.0f; // in grid cells; smallish so channels stay rill-sharp
     float inertia = 0.18f;
     float capacity = 3.6f;
     float minCapacity = 0.02f;
@@ -135,7 +137,12 @@ public:
                 float mountainMask = smoothstep01((massif - 0.30f) / 0.48f);
                 float soft = base * 0.72f + detail * 0.22f + micro * 0.06f;
                 float sharp = ridge * 0.80f + detail * 0.14f + micro * 0.06f;
-                float h = glm::mix(soft, sharp, glm::clamp(settings.ridged, 0.0f, 1.0f));
+                // Vertical zonation, like real massifs: valley floors and lower flanks
+                // stay soft (their texture comes from fluvial carving below), craggy
+                // ridged relief only takes over toward the tops.
+                float rockZone = smoothstep01((soft - 0.40f) / 0.32f);
+                float mixAmt = glm::clamp(settings.ridged, 0.0f, 1.0f) * glm::mix(0.22f, 1.0f, rockZone);
+                float h = glm::mix(soft, sharp, mixAmt);
                 h = std::pow(glm::clamp(h, 0.0f, 1.0f), settings.peakSharpness);
                 h *= glm::mix(0.42f, 1.18f, mountainMask) * islandMask;
                 heights_[idx(x, z)] = h;
@@ -147,39 +154,107 @@ public:
             h = (h - minHeight) / std::max(maxHeight - minHeight, 0.001f);
             h = h * settings.heightScale;
         }
+        // Real-terrain pipeline: carve connected drainage first, add droplet rills on
+        // top of it, then let thermal relaxation build scree below the (protected) crags.
+        fluvialCarve(settings.fluvial, 3);
+        if (settings.genDrops > 0) {
+            erosionRng_.seed(static_cast<std::uint32_t>(settings.seed) * 2654435761u
+                             + static_cast<std::uint32_t>(settings.genDrops)); // deterministic per seed
+            erodeDrops(settings.genDrops);
+            hasErosionFlow_ = true;
+        }
         thermalErode(settings.thermalIters, settings.talusAngle, 0.30f);
-        smoothHeightmap(1, 0.08f);
+        smoothHeightmap(1, 0.05f);
         rebuildSurfaceState();
         rebuildVertices();
     }
 
+    // Flow-accumulation ("stream power") carving: route each cell to its steepest
+    // downhill neighbour, accumulate drainage area top-down, and deepen cells in
+    // proportion to area^0.45 * slope. The per-edge carve is capped at 35% of the drop
+    // to the receiver, so an edge can never invert — the network stays monotonic and
+    // spike/pit-free by construction. This is what draws connected valleys and gully
+    // trees instead of disconnected noise dents.
+    void fluvialCarve(float strength, int iterations)
+    {
+        if (strength <= 0.001f || iterations <= 0) return;
+        const int N = kTerrainSize;
+        const float cell = kTerrainWorldSize / static_cast<float>(N - 1);
+        std::vector<int> receiver(static_cast<std::size_t>(N) * N);
+        std::vector<float> recvDist(static_cast<std::size_t>(N) * N);
+        std::vector<float> area(static_cast<std::size_t>(N) * N);
+        std::vector<int> order(static_cast<std::size_t>(N) * N);
+        static constexpr int kOff[8][2] = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+        for (int it = 0; it < iterations; ++it) {
+            for (int z = 0; z < N; ++z) {
+                for (int x = 0; x < N; ++x) {
+                    int c = idx(x, z);
+                    receiver[c] = -1;
+                    if (x == 0 || z == 0 || x == N - 1 || z == N - 1) continue; // drains off-map
+                    float best = 0.0f;
+                    for (const auto& o : kOff) {
+                        int n = idx(x + o[0], z + o[1]);
+                        float dist = (o[0] != 0 && o[1] != 0) ? cell * 1.41421f : cell;
+                        float s = (heights_[c] - heights_[n]) / dist;
+                        if (s > best) { best = s; receiver[c] = n; recvDist[c] = dist; }
+                    }
+                }
+            }
+            for (int i = 0; i < N * N; ++i) order[i] = i;
+            std::sort(order.begin(), order.end(), [&](int a, int b) { return heights_[a] > heights_[b]; });
+            std::fill(area.begin(), area.end(), 1.0f);
+            for (int c : order) {
+                if (receiver[c] >= 0) area[receiver[c]] += area[c];
+            }
+            for (int c = 0; c < N * N; ++c) {
+                int r = receiver[c];
+                if (r < 0) continue;
+                float drop = heights_[c] - heights_[r];
+                if (drop <= 0.0f) continue;
+                float slope = drop / recvDist[c];
+                float amt = strength * 0.02f * std::pow(area[c], 0.45f) * slope;
+                heights_[c] -= std::min(amt, 0.35f * drop);
+            }
+        }
+    }
+
     // Thermal erosion: material above the angle of repose slumps to the neighbour below,
     // turning noise-sharp cliffs into scree aprons and consistent talus slopes.
+    // Hardness-masked: high ground is treated as bedrock (real crags hold far past the
+    // angle of repose), so aretes and summit towers stay serrated while the loose lower
+    // slopes relax. Uniform thermal was rounding exactly the silhouettes that sell a
+    // mountain.
     void thermalErode(int iterations, float talusAngleDeg, float rate)
     {
         if (iterations <= 0) return;
         float cell = kTerrainWorldSize / static_cast<float>(kTerrainSize - 1);
         float maxDiff = std::tan(glm::radians(glm::clamp(talusAngleDeg, 10.0f, 60.0f))) * cell;
+        float invScale = 1.0f / std::max(settings_.heightScale, 0.001f);
         // pair each cell with its E, S, SE, SW neighbours so every edge is visited once
         static constexpr int kNb[4][2] = {{1, 0}, {0, 1}, {1, 1}, {-1, 1}};
         std::vector<float> delta(heights_.size());
+        std::vector<float> hard(heights_.size());
         for (int it = 0; it < iterations; ++it) {
+            for (std::size_t i = 0; i < heights_.size(); ++i)
+                hard[i] = smoothstep01((heights_[i] * invScale - 0.48f) / 0.30f); // 0 low, 1 summit rock
             std::fill(delta.begin(), delta.end(), 0.0f);
             for (int z = 0; z < kTerrainSize - 1; ++z) {
                 for (int x = 1; x < kTerrainSize - 1; ++x) {
                     int c = idx(x, z);
                     for (const auto& nb : kNb) {
                         int n = idx(x + nb[0], z + nb[1]);
-                        float lim = maxDiff * ((nb[0] != 0 && nb[1] != 0) ? 1.41421f : 1.0f);
+                        float diag = (nb[0] != 0 && nb[1] != 0) ? 1.41421f : 1.0f;
                         float d = heights_[c] - heights_[n];
-                        if (d > lim) {
-                            float move = rate * (d - lim) * 0.5f;
-                            delta[c] -= move;
-                            delta[n] += move;
-                        } else if (-d > lim) {
-                            float move = rate * (-d - lim) * 0.5f;
-                            delta[n] -= move;
-                            delta[c] += move;
+                        int hi = d > 0.0f ? c : n;
+                        int lo = d > 0.0f ? n : c;
+                        // bedrock: much higher effective repose angle and slower creep
+                        float h = hard[hi];
+                        float lim = maxDiff * diag * (1.0f + 2.6f * h);
+                        float ad = std::fabs(d);
+                        if (ad > lim) {
+                            float move = rate * (1.0f - 0.85f * h) * (ad - lim) * 0.5f;
+                            delta[hi] -= move;
+                            delta[lo] += move;
                         }
                     }
                 }
@@ -636,8 +711,8 @@ private:
                     float h = heights_[index];
                     float neighborAverage = (heights_[idx(x - 1, z)] + heights_[idx(x + 1, z)] + heights_[idx(x, z - 1)] + heights_[idx(x, z + 1)]) * 0.25f;
                     float height01 = h / std::max(settings_.heightScale, 0.001f);
-                    float peakPreserve = glm::smoothstep(0.74f, 0.96f, height01);
-                    next[index] = glm::mix(h, neighborAverage, strength * (1.0f - peakPreserve * 0.58f));
+                    float peakPreserve = glm::smoothstep(0.52f, 0.85f, height01);
+                    next[index] = glm::mix(h, neighborAverage, strength * (1.0f - peakPreserve * 0.88f));
                 }
             }
             heights_.swap(next);
