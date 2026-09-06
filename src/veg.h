@@ -69,6 +69,28 @@ public:
         // ~10 m spacing in dense forest
         float maxTreesPerCell = std::max(0.5f, (cellMeters * cellMeters) / (10.0f * 10.0f));
 
+        // Widened water mask: no trees or boulders in pools or along channels.
+        std::vector<float> wet = terrain.waterMap();
+        if (wet.size() == static_cast<std::size_t>(N * N)) {
+            std::vector<float> tmp(wet.size());
+            for (int pass = 0; pass < 2; ++pass) {
+                for (int z = 0; z < N; ++z) for (int x = 0; x < N; ++x) {
+                    float m = 0.0f;
+                    for (int dz = -1; dz <= 1; ++dz) for (int dx = -1; dx <= 1; ++dx) {
+                        int sx = std::clamp(x + dx, 0, N - 1), sz = std::clamp(z + dz, 0, N - 1);
+                        m = std::max(m, wet[sz * N + sx]);
+                    }
+                    tmp[z * N + x] = m;
+                }
+                wet.swap(tmp);
+            }
+        }
+        const std::vector<float>& flowM = terrain.flowMap();
+        auto isWet = [&](int i) {
+            float w = wet.empty() ? 0.0f : wet[i];
+            float fl = flowM.empty() ? 0.0f : flowM[i];
+            return w > 0.10f || fl > 0.68f;
+        };
         struct Keyed { int key; Instance inst; };
         std::vector<Keyed> kt, kr;
         kt.reserve(600000);
@@ -80,6 +102,7 @@ public:
                 float hN = (H[i] - minH) / span;
                 float slope = terrain.slopeAt(x, z);
                 int key = (z / kSub) * gridN + (x / kSub);
+                if (isWet(i)) continue;
                 if (density > 0.12f && kt.size() < 1500000) {
                     float expected = density * maxTreesPerCell;
                     int n = static_cast<int>(expected);
@@ -183,6 +206,8 @@ public:
             int perCell = static_cast<int>(cellMeters * cellMeters / 1.6f);   // one tuft per 1.3x1.3 m
             const std::vector<float>& H = terrain.heights();
             const std::vector<float>& F = terrain.forestMap();
+            const std::vector<float>& W = terrain.waterMap();
+            const std::vector<float>& FL = terrain.flowMap();
             float minH = 1e9f, maxH = -1e9f;
             for (float h : H) { minH = std::min(minH, h); maxH = std::max(maxH, h); }
             float span = std::max(maxH - minH, 0.001f);
@@ -195,6 +220,8 @@ public:
                     int ci = cz * N + cx;
                     float slope = terrain.slopeAt(cx, cz);
                     if (slope > 0.22f) continue;
+                    if (!W.empty() && W[ci] > 0.08f) continue;
+                    if (!FL.empty() && FL[ci] > 0.66f) continue;
                     float hN = (H[ci] - minH) / span;
                     if (hN > 0.72f) continue;
                     float forestHere = F.empty() ? 0.0f : F[ci];
@@ -233,6 +260,7 @@ public:
             const int N = kTerrainSize;
             const float radius = 2.6f;
             const std::vector<float>& F = terrain.forestMap();
+            const std::vector<float>& W = terrain.waterMap();
             int cx0 = static_cast<int>(std::floor(((camPos.x - radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
             int cx1 = static_cast<int>(std::ceil(((camPos.x + radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
             int cz0 = static_cast<int>(std::floor(((camPos.z - radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
@@ -242,6 +270,7 @@ public:
                     int ci = cz * N + cx;
                     float slope = terrain.slopeAt(cx, cz);
                     if (slope > 0.30f) continue;
+                    if (!W.empty() && W[ci] > 0.08f) continue;
                     float forestHere = F.empty() ? 0.0f : F[ci];
                     std::uint32_t r = static_cast<std::uint32_t>(cx * 2654435761u) ^ static_cast<std::uint32_t>(cz * 40503u) ^ 0x51ED27u;
                     r = r * 1664525u + 1013904223u;

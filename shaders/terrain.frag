@@ -375,9 +375,10 @@ void main()
         float pocketWater = smoothstep(waterLevel - 0.006, waterLevel + 0.003, waterLevel - height01)
                           * smoothstep(0.48, 0.82, vHydro.x) * 0.18;
         wetWash = clamp((routeWater + pocketWater) * showWater, 0.0, 1.0);
-        vec3 washColor = mix(vec3(0.58, 0.62, 0.60), vec3(0.72, 0.76, 0.73), broad);
-        vec3 channelColor = mix(washColor, vec3(0.44, 0.55, 0.57), smoothstep(0.78, 1.0, vHydro.x));
-        base = mix(base, channelColor, wetWash * 0.54);
+        // Water reads blue: shallow wash is a muted slate blue, pools go deeper teal-blue.
+        vec3 washColor = mix(vec3(0.30, 0.42, 0.52), vec3(0.40, 0.54, 0.64), broad);
+        vec3 channelColor = mix(washColor, vec3(0.14, 0.32, 0.48), smoothstep(0.55, 1.0, vHydro.x));
+        base = mix(base, channelColor, wetWash * mix(0.55, 0.85, smoothstep(0.5, 1.0, vHydro.x)));
     }
     wet = max(wet * 0.6, wetWash);
     float snowMask = snow;

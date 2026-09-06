@@ -632,6 +632,8 @@ private:
 
 public:
     const std::vector<std::uint8_t>& ecoPixels() const { return ecoPixels_; }
+    const std::vector<float>& waterMap() const { return displayWater_; }
+    const std::vector<float>& flowMap() const { return flowAccum_; }
     const std::vector<float>& forestMap() const { return forest_; }
     const std::vector<float>& heights() const { return heights_; }
     float slopeAt(int x, int z) const
