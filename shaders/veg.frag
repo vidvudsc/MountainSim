@@ -6,6 +6,7 @@ layout(location = 2) in vec3 vColor;
 layout(location = 3) in float vShadow;
 layout(location = 4) in float vHeight01;
 layout(location = 5) in float vType;
+layout(location = 6) in float vFade;
 
 layout(set = 0, binding = 0) uniform SceneUniforms {
     mat4 view;
@@ -36,11 +37,16 @@ void main()
     vec3 L = normalize(u.sunDir.xyz);
     vec3 V = normalize(u.cameraPos.xyz - vWorldPos);
     vec3 n = normalize(vNormal);
-    if (vType >= 2.5 && dot(n, V) < 0.0) n = -n;                 // billboards and grass are two-sided
-    if (vType > 3.5) n = normalize(mix(n, vec3(0.0, 1.0, 0.0), 0.6)); // grass lights like the ground
+    if (vType >= 2.5 && vType < 5.5 && dot(n, V) < 0.0) n = -n;   // billboards, grass, ferns are two-sided
+    if (vType > 3.5 && vType < 5.5) n = normalize(mix(n, vec3(0.0, 1.0, 0.0), 0.6)); // grass/ferns light like the ground
     if (vType > 2.5 && vType < 3.5) n = normalize(vec3(0.0, 1.0, 0.0) * 0.8 + L * 0.35); // far trees: average canopy lighting
 
     vec3 albedo = vColor;
+    if (vType > 5.5) {
+        // Moss rock: grey stone with moss on top, more moss under forest (fade carries forest cover).
+        float moss = clamp(n.y, 0.0, 1.0) * (0.35 + 0.65 * vFade);
+        albedo = mix(vColor, vec3(0.16, 0.30, 0.12), smoothstep(0.35, 0.8, moss));
+    }
     float hv = (vType > 2.5 && vType < 3.5) ? 0.5 : hash(floor(vWorldPos.xz * 37.0));
     albedo *= 0.75 + 0.5 * hv;
     albedo = mix(albedo, albedo * vec3(1.15, 1.0, 0.7), (hv - 0.5) * 0.5);

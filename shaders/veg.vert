@@ -32,6 +32,7 @@ layout(location = 2) out vec3 vColor;
 layout(location = 3) out float vShadow;
 layout(location = 4) out float vHeight01;
 layout(location = 5) out float vType;
+layout(location = 6) out float vFade;
 
 const float WS = 165.0;
 
@@ -76,6 +77,7 @@ void main()
     }
     vHeight01 = clamp(inPosition.y * 60.0, 0.0, 1.0);   // unit object is 1 m tall (1/kMetersPerUnit units)
     vType = inRotType.y;
+    vFade = inRotType.z;
     // Far billboards: cheap 4-step march; meshes get the full one.
     vec3 sd = normalize(u.sunDir.xyz);
     if (inRotType.y > 2.5 && inRotType.y < 3.5) {

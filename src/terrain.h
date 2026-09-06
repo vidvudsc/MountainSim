@@ -463,6 +463,8 @@ private:
         }
         // Forest density: below a treeline, gentler ground, clumped, following drainage.
         {
+            std::vector<float> wideWater = displayWater_;
+            if (!wideWater.empty()) blurField(wideWater, 2);
             Perlin2D perlin(settings_.seed + 4001);
             auto fbm2 = [&](float x, float z, int oct, float freq) {
                 float amp = 1.0f, sum = 0.0f, norm = 0.0f;
@@ -490,10 +492,11 @@ private:
                 f *= 1.0f - smoothstep01((slope - 0.16f) / 0.14f);
                 f *= smoothstep01((clump * 0.70f + drainage * 0.45f + 0.28f - 0.30f) / 0.30f);
                 f *= (1.0f - rock);
-                // No forest in lakes or on stream beds; a bare strip follows the channels.
-                float water = displayWater_.empty() ? 0.0f : displayWater_[i];
-                f *= 1.0f - smoothstep01((water - 0.30f) / 0.30f);
-                f *= 1.0f - smoothstep01((flowAccum_[i] - 0.62f) / 0.18f) * 0.85f;
+                // No forest in water or on the wash tracks; the clearing is widened by a blur so
+                // the strip along a channel is a few cells wide, not a one-cell line.
+                float water = wideWater.empty() ? 0.0f : wideWater[i];
+                f *= 1.0f - smoothstep01((water - 0.10f) / 0.22f);
+                f *= 1.0f - smoothstep01((flowAccum_[i] - 0.60f) / 0.18f) * 0.9f;
                 forest_[i] = glm::clamp(f, 0.0f, 1.0f);
             }
             blurField(forest_, 1);

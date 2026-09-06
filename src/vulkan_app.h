@@ -132,7 +132,7 @@ private:
     bool wireframe_ = false;
     bool showFlowParticles_ = true;
     bool erosionAnimating_ = false;
-    float erosionSpeed_ = 0.35f;
+    float erosionSpeed_ = 0.6f;
     bool framebufferResized_ = false;
     bool hideUi_ = false;
     // Walk mode: first-person camera glued to the ground (F toggles). WASD walks, mouse
@@ -856,7 +856,7 @@ private:
     void drawVegetation(VkCommandBuffer cmd)
     {
         const Vegetation::DrawGroups& g = vegGroups_[currentFrame_];
-        std::uint32_t total = g.conifer[1] + g.broadleaf[1] + g.boulder[1] + g.billboard[1] + g.grass[1];
+        std::uint32_t total = g.conifer[1] + g.broadleaf[1] + g.boulder[1] + g.billboard[1] + g.grass[1] + g.fern[1] + g.mossRock[1];
         if (!showVegetation_ || total == 0) return;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vegPipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
@@ -873,6 +873,8 @@ private:
         draw(veg_.boulder, g.boulder);
         draw(veg_.billboard, g.billboard);
         draw(veg_.grass, g.grass);
+        draw(veg_.fern, g.fern);
+        draw(veg_.mossRock, g.mossRock);
     }
 
     void createSkyPipeline()
@@ -2033,7 +2035,7 @@ private:
         if (ImGui::GetIO().WantCaptureMouse && !camera_.orbiting && !camera_.panning) return;
         glm::vec3 forward = glm::normalize(camera_.target - camera_.position);
         glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
-        float scale = camera_.distance * camera_.panSpeed * 0.055f;
+        float scale = std::max(camera_.distance, 6.0f) * camera_.panSpeed * 0.055f;
         camera_.distance *= std::pow(0.86f, static_cast<float>(yOffset));
         camera_.distance = glm::clamp(camera_.distance, 0.6f, 260.0f);
         camera_.target += (-right * static_cast<float>(xOffset)) * scale;
@@ -2148,7 +2150,7 @@ private:
                 glm::vec3 forward = glm::normalize(camera_.target - camera_.position);
                 glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
                 glm::vec3 up = glm::normalize(glm::cross(right, forward));
-                float scale = camera_.distance * camera_.panSpeed * 0.004f;
+                float scale = std::max(camera_.distance, 6.0f) * camera_.panSpeed * 0.004f;
                 camera_.target += (-right * dx + up * dy) * scale;
                 camera_.lastInput = "drag pan";
             }
@@ -2158,8 +2160,8 @@ private:
             glm::vec3 forward = glm::normalize(camera_.target - camera_.position);
             glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
             glm::vec3 planarForward = glm::normalize(glm::vec3(forward.x, 0.0f, forward.z));
-            float velocity = camera_.distance * 0.42f * dt;
-            if (glfwGetKey(window_, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) velocity *= 2.0f;
+            float velocity = std::max(camera_.distance, 10.0f) * 0.42f * dt;
+            if (glfwGetKey(window_, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) velocity *= 4.0f;
             if (glfwGetKey(window_, GLFW_KEY_W) == GLFW_PRESS) camera_.target += planarForward * velocity;
             if (glfwGetKey(window_, GLFW_KEY_S) == GLFW_PRESS) camera_.target -= planarForward * velocity;
             if (glfwGetKey(window_, GLFW_KEY_A) == GLFW_PRESS) camera_.target -= right * velocity;
@@ -2268,11 +2270,13 @@ private:
     {
         if (!erosionAnimating_) return;
         // Feed droplets in batches so a frame never steps the whole run at once.
-        const int maxActive = 9000;
-        if (pendingDrops_ > 0) pendingDrops_ -= terrain_.spawnLiveDroplets(std::min(pendingDrops_, 2500), maxActive);
+        const int maxActive = 30000;
+        if (pendingDrops_ > 0) pendingDrops_ -= terrain_.spawnLiveDroplets(std::min(pendingDrops_, 8000), maxActive);
         ++erosionFrame_;
-        bool rebuild = (erosionFrame_ % 3) == 0;
-        terrain_.stepLiveDroplets(erosionSpeed_, rebuild);
+        bool rebuild = (erosionFrame_ % 2) == 0;
+        // Several physics steps per frame: the animation is for watching, not for stalling.
+        int substeps = std::max(1, static_cast<int>(std::round(erosionSpeed_ * 6.0f)));
+        for (int k = 0; k < substeps; ++k) terrain_.stepLiveDroplets(1.0f, rebuild && k == substeps - 1);
         if (rebuild) terrainDirty_ = true;
         if (!terrain_.hasActiveDroplets() && pendingDrops_ <= 0) {
             erosionAnimating_ = false;
@@ -2316,7 +2320,7 @@ private:
         ImGui::SliderFloat("Capacity", &terrain_.settings().capacity, 1.0f, 10.0f, "%.1f");
         ImGui::SliderFloat("Evaporation", &terrain_.settings().evaporation, 0.005f, 0.12f, "%.3f");
         ImGui::Checkbox("Show particles", &showFlowParticles_);
-        ImGui::SliderFloat("Simulation speed", &erosionSpeed_, 0.06f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Simulation speed", &erosionSpeed_, 0.15f, 2.0f, "%.2f");
         // Latch the disabled state: the button click flips erosionAnimating_ mid-frame,
         // which used to call EndDisabled() without a matching BeginDisabled().
         bool erosionDisabled = erosionAnimating_;

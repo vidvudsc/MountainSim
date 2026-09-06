@@ -44,7 +44,7 @@ public:
     // ---- meshes (built once) -------------------------------------------------------------
     std::vector<VegVertex> vertices;
     std::vector<std::uint32_t> indices;
-    VegMeshRange conifer, broadleaf, boulder, billboard, grass;
+    VegMeshRange conifer, broadleaf, boulder, billboard, grass, fern, mossRock;
 
     // ---- placement -------------------------------------------------------------------------
     std::vector<Instance> trees, rocks;
@@ -129,7 +129,7 @@ public:
     }
 
     // Gather this frame's instances. Output is grouped: [conifer][broadleaf][boulder][billboard][grass].
-    struct DrawGroups { std::uint32_t conifer[2], broadleaf[2], boulder[2], billboard[2], grass[2]; };
+    struct DrawGroups { std::uint32_t conifer[2], broadleaf[2], boulder[2], billboard[2], grass[2], fern[2], mossRock[2]; };
 
     DrawGroups gather(const Terrain& terrain, const glm::vec3& camPos, const glm::vec3& camFwd, VegInstanceGpu* out, std::uint32_t cap) const
     {
@@ -172,14 +172,15 @@ public:
             std::uint32_t* dst = (pass == 0) ? g.conifer : (pass == 1) ? g.broadleaf : (pass == 2) ? g.boulder : g.billboard;
             dst[0] = begin; dst[1] = count - begin;
         }
-        // grass: hashed per cell around the camera, nothing stored
-        {
+        // grass then ferns: hashed per cell around the camera, nothing stored
+        for (int fernPassI = 0; fernPassI < 2; ++fernPassI) {
+            bool fernPass = fernPassI == 1;
             std::uint32_t begin = count;
             const int N = kTerrainSize;
             float cell = kTerrainWorldSize / static_cast<float>(N - 1);
             float cellMeters = cell * kMetersPerUnit;
-            const float radius = 2.4f;   // ~145 m
-            int perCell = static_cast<int>(cellMeters * cellMeters / 9.0f);   // one tuft per 3x3 m
+            const float radius = 3.2f;   // ~190 m
+            int perCell = static_cast<int>(cellMeters * cellMeters / 1.6f);   // one tuft per 1.3x1.3 m
             const std::vector<float>& H = terrain.heights();
             const std::vector<float>& F = terrain.forestMap();
             float minH = 1e9f, maxH = -1e9f;
@@ -196,7 +197,9 @@ public:
                     if (slope > 0.22f) continue;
                     float hN = (H[ci] - minH) / span;
                     if (hN > 0.72f) continue;
-                    float density = (1.0f - glm::clamp((slope - 0.12f) / 0.10f, 0.0f, 1.0f)) * (1.0f - 0.5f * (F.empty() ? 0.0f : F[ci]));
+                    float forestHere = F.empty() ? 0.0f : F[ci];
+                    // Meadow: grass. Forest floor: fewer grass tufts but ferns take over.
+                    float density = (1.0f - glm::clamp((slope - 0.12f) / 0.10f, 0.0f, 1.0f)) * (1.0f - 0.35f * forestHere);
                     int n = static_cast<int>(perCell * density);
                     std::uint32_t r = static_cast<std::uint32_t>(cx * 73856093) ^ static_cast<std::uint32_t>(cz * 19349663) ^ 0x9E3779B9u;
                     for (int k = 0; k < n && count < cap; ++k) {
@@ -212,12 +215,52 @@ public:
                         float fade = 1.0f - glm::clamp((std::sqrt(d2) - radius * 0.55f) / (radius * 0.45f), 0.0f, 1.0f);
                         if (fade <= 0.02f) continue;
                         float wy = terrain.surfaceHeightAtWorld(wx, wz) - 0.02f / kMetersPerUnit;
-                        Instance in{wx, wy, wz, (0.35f + fr * 0.45f) * fade, fr * 6.2831853f, 4};
-                        push(in, 4.0f, 1.0f, fade);
+                        // Every 7th tuft in forest becomes a fern (bigger, darker, drooping).
+                        bool fern = forestHere > 0.25f && (k % 7 == 0);
+                        if (fern != fernPass) continue;
+                        float h = fern ? (0.9f + fr * 0.8f) : (0.45f + fr * 0.55f);
+                        Instance in{wx, wy, wz, h * fade, fr * 6.2831853f, static_cast<std::uint8_t>(fern ? 5 : 4)};
+                        push(in, fern ? 5.0f : 4.0f, 1.0f, fade);
                     }
                 }
             }
-            g.grass[0] = begin; g.grass[1] = count - begin;
+            if (!fernPass) { g.grass[0] = begin; g.grass[1] = count - begin; }
+            else { g.fern[0] = begin; g.fern[1] = count - begin; }
+        }
+        // Small mossy rocks scattered on the forest floor and meadows near the camera.
+        {
+            std::uint32_t begin = count;
+            const int N = kTerrainSize;
+            const float radius = 2.6f;
+            const std::vector<float>& F = terrain.forestMap();
+            int cx0 = static_cast<int>(std::floor(((camPos.x - radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
+            int cx1 = static_cast<int>(std::ceil(((camPos.x + radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
+            int cz0 = static_cast<int>(std::floor(((camPos.z - radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
+            int cz1 = static_cast<int>(std::ceil(((camPos.z + radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
+            for (int cz = std::max(cz0, 0); cz <= std::min(cz1, N - 2); ++cz) {
+                for (int cx = std::max(cx0, 0); cx <= std::min(cx1, N - 2); ++cx) {
+                    int ci = cz * N + cx;
+                    float slope = terrain.slopeAt(cx, cz);
+                    if (slope > 0.30f) continue;
+                    float forestHere = F.empty() ? 0.0f : F[ci];
+                    std::uint32_t r = static_cast<std::uint32_t>(cx * 2654435761u) ^ static_cast<std::uint32_t>(cz * 40503u) ^ 0x51ED27u;
+                    r = r * 1664525u + 1013904223u;
+                    int n = ((r >> 8) % 100) < static_cast<unsigned>(25 + 45 * forestHere) ? 1 : 0;
+                    for (int k = 0; k < n && count < cap; ++k) {
+                        r = r * 1664525u + 1013904223u; float fx = (r >> 8) / 16777216.0f;
+                        r = r * 1664525u + 1013904223u; float fz = (r >> 8) / 16777216.0f;
+                        r = r * 1664525u + 1013904223u; float fr = (r >> 8) / 16777216.0f;
+                        float wx = ((cx + fx) / (N - 1) - 0.5f) * kTerrainWorldSize;
+                        float wz = ((cz + fz) / (N - 1) - 0.5f) * kTerrainWorldSize;
+                        float ddx = wx - camPos.x, ddz = wz - camPos.z;
+                        if (ddx * ddx + ddz * ddz > radius * radius) continue;
+                        float wy = terrain.surfaceHeightAtWorld(wx, wz) - 0.25f / kMetersPerUnit;
+                        Instance in{wx, wy, wz, 0.6f + fr * fr * 2.2f, fr * 6.2831853f, 6};
+                        push(in, 6.0f, 1.0f, forestHere);
+                    }
+                }
+            }
+            g.mossRock[0] = begin; g.mossRock[1] = count - begin;
         }
         return g;
     }
@@ -333,15 +376,15 @@ private:
         billboard = finishRange(f0);
 
         f0 = static_cast<std::uint32_t>(indices.size());
-        for (int k = 0; k < 12; ++k) {
-            float a = k / 12.0f * 6.2831853f + rand01() * 0.4f;
-            float lean = 0.25f + rand01() * 0.35f;
-            float hgt = 0.7f + rand01() * 0.5f;
-            float w = 0.05f + rand01() * 0.04f;
+        for (int k = 0; k < 18; ++k) {
+            float a = k / 18.0f * 6.2831853f + rand01() * 0.4f;
+            float lean = 0.30f + rand01() * 0.45f;
+            float hgt = 0.6f + rand01() * 0.6f;
+            float w = 0.035f + rand01() * 0.03f;
             glm::vec3 d{std::cos(a), 0, std::sin(a)};
             glm::vec3 side{-std::sin(a) * w, 0, std::cos(a) * w};
-            glm::vec3 root{d.x * 0.12f, 0, d.z * 0.12f};
-            glm::vec3 base{0.36f, 0.44f, 0.16f}, tip{0.55f, 0.59f, 0.27f};
+            glm::vec3 root{d.x * 0.10f, 0, d.z * 0.10f};
+            glm::vec3 base{0.20f, 0.34f, 0.10f}, tip{0.42f, 0.55f, 0.20f};
             glm::vec3 n{d.x, 0.6f, d.z};
             int i0 = addVertex((root - side) * s, n, base);
             int i1 = addVertex((root + side) * s, n, base);
@@ -349,5 +392,35 @@ private:
             tri(i0, i1, i2);
         }
         grass = finishRange(f0);
+
+        // Fern: 8 long drooping fronds, each a strip of 4 quads, darker green.
+        f0 = static_cast<std::uint32_t>(indices.size());
+        for (int k = 0; k < 11; ++k) {
+            float a = k / 11.0f * 6.2831853f + rand01() * 0.5f;
+            glm::vec3 d{std::cos(a), 0, std::sin(a)};
+            glm::vec3 side{-std::sin(a), 0, std::cos(a)};
+            glm::vec3 col{0.11f, 0.24f, 0.10f};
+            int prevL = -1, prevR = -1;
+            for (int seg = 0; seg <= 6; ++seg) {
+                float t = seg / 6.0f;
+                float serr = (seg % 2 == 0) ? 1.0f : 0.55f;
+                float w = (0.03f + 0.09f * std::sin(t * 3.14159f)) * serr * (seg == 6 ? 0.2f : 1.0f);
+                float out = t * 0.9f;
+                float up = 0.15f + 0.85f * std::sin(t * 2.4f) - t * t * 0.45f;
+                glm::vec3 c = glm::vec3(d.x * out, up, d.z * out) * s;
+                glm::vec3 n = glm::normalize(glm::vec3(d.x * 0.3f, 1.0f, d.z * 0.3f));
+                glm::vec3 shade = col * (0.85f + 0.3f * t);
+                int L = addVertex(c - side * (w * s), n, shade);
+                int R = addVertex(c + side * (w * s), n, shade);
+                if (prevL >= 0) { tri(prevL, prevR, L); tri(prevR, R, L); }
+                prevL = L; prevR = R;
+            }
+        }
+        fern = finishRange(f0);
+
+        // Moss rock: small lumpy boulder, greenish grey; instance fade carries forest cover for a mossier tint.
+        f0 = static_cast<std::uint32_t>(indices.size());
+        blob({0, 0.35f * s, 0}, 0.5f, 0.75f, 4, 7, {0.34f, 0.36f, 0.30f}, 0.5f);
+        mossRock = finishRange(f0);
     }
 };
