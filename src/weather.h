@@ -71,6 +71,17 @@ enum class WeatherField {
     Vorticity,
 };
 
+struct WeatherTimings {
+    float stepMs = 0.0f;
+    float forceMs = 0.0f;
+    float advectMs = 0.0f;
+    float microMs = 0.0f;
+    float projectMs = 0.0f;
+    float diffuseMs = 0.0f;
+    float snapshotMs = 0.0f;
+    int substeps = 0;
+};
+
 class Weather {
 public:
     ~Weather() { stopWorker(); }
@@ -102,6 +113,9 @@ public:
         poissonDirty_ = true;
         colHeight_.assign(static_cast<std::size_t>(nx_) * nz_, baseY_);
         surfaceJ_.assign(static_cast<std::size_t>(nx_) * nz_, 0);
+        surfaceShade_.assign(static_cast<std::size_t>(nx_) * nz_, 1.0f);
+        shadeSunDir_ = {0.0f, -1.0f, 0.0f};
+        shadeDirty_ = true;
         precipRate_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
         precipAccum_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
         lightning_.assign(static_cast<std::size_t>(nx_) * nz_, 0.0f);
@@ -120,6 +134,7 @@ public:
         if (!configured_ || colHeights.size() != colHeight_.size()) return;
         colHeight_ = colHeights;
         rebuildMask();
+        shadeDirty_ = true;
     }
 
     void reset(const WeatherParams& p)
@@ -225,6 +240,11 @@ public:
     // Snapshot-wide maxima; 1.0 (i.e. "assume non-empty") when no snapshot exists yet.
     float viewMaxQc() const { return viewSnap_ ? viewSnap_->maxQc : 1.0f; }
     float viewMaxQr() const { return viewSnap_ ? viewSnap_->maxQr : 1.0f; }
+    WeatherTimings timings() const
+    {
+        std::lock_guard<std::mutex> lk(timingMtx_);
+        return timings_;
+    }
     // World-space focus of the strongest active lightning column plus flash intensity in
     // w (zero when no flash) — lets the renderer light the scene from the discharge.
     glm::vec4 lightningLight() const
@@ -336,6 +356,9 @@ private:
     bool poissonDirty_ = true;
     std::vector<float> colHeight_;
     std::vector<int> surfaceJ_;
+    std::vector<float> surfaceShade_;
+    glm::vec3 shadeSunDir_{0.0f, -1.0f, 0.0f};
+    bool shadeDirty_ = true;
     std::vector<float> precipRate_, precipAccum_;
     std::vector<float> lightning_, stormCharge_, lightningCooldown_;
     float lightningFlash_ = 0.0f;
@@ -385,6 +408,8 @@ private:
     bool ctrlRunning_ = false;
     WeatherParams ctrlParams_{};
     glm::vec3 ctrlSun_{0.0f, 1.0f, 0.0f};
+    mutable std::mutex timingMtx_;
+    WeatherTimings timings_{};
 
     // Active array selectors: the snapshot the render thread is viewing, else live arrays.
     const std::vector<float>& aU() const { return viewSnap_ ? viewSnap_->u : u_; }
@@ -411,12 +436,18 @@ private:
 
     void stepInternal(float realDt, const WeatherParams& p, const glm::vec3& sunDir)
     {
+        using clock = std::chrono::steady_clock;
+        auto t0 = clock::now();
         vScale_ = p.vScale;
         float simDt = std::min(realDt * p.timeScale, 4.0f);
         int sub = std::max(1, static_cast<int>(std::ceil(simDt / 1.2f)));
         float dt = simDt / static_cast<float>(sub);
         for (int s = 0; s < sub; ++s) integrate(dt, p, sunDir);
         simTime_ += simDt;
+        float ms = std::chrono::duration<float, std::milli>(clock::now() - t0).count();
+        std::lock_guard<std::mutex> lk(timingMtx_);
+        timings_.stepMs = ms;
+        timings_.substeps = sub;
     }
 
     void workerLoop()
@@ -439,7 +470,11 @@ private:
             {
                 std::lock_guard<std::mutex> lk(stepMtx_);
                 stepInternal(realDt, p, sun);
+                auto snapStart = clock::now();
                 snap = makeSnapshot();
+                float snapMs = std::chrono::duration<float, std::milli>(clock::now() - snapStart).count();
+                std::lock_guard<std::mutex> tlk(timingMtx_);
+                timings_.snapshotMs = snapMs;
             }
             {
                 std::lock_guard<std::mutex> lk(histMtx_);
@@ -668,6 +703,51 @@ private:
         });
     }
 
+    glm::vec3 trilinearVec(const std::vector<float>& x, const std::vector<float>& y, const std::vector<float>& z,
+                           float gi, float gj, float gk) const
+    {
+        gi = glm::clamp(gi, 0.0f, nx_ - 1.001f);
+        gj = glm::clamp(gj, 0.0f, ny_ - 1.001f);
+        gk = glm::clamp(gk, 0.0f, nz_ - 1.001f);
+        int i0 = static_cast<int>(gi), j0 = static_cast<int>(gj), k0 = static_cast<int>(gk);
+        int i1 = std::min(i0 + 1, nx_ - 1), j1 = std::min(j0 + 1, ny_ - 1), k1 = std::min(k0 + 1, nz_ - 1);
+        float fi = gi - i0, fj = gj - j0, fk = gk - k0;
+        auto sample = [&](const std::vector<float>& f) {
+            float c000 = f[idx(i0, j0, k0)], c100 = f[idx(i1, j0, k0)];
+            float c010 = f[idx(i0, j1, k0)], c110 = f[idx(i1, j1, k0)];
+            float c001 = f[idx(i0, j0, k1)], c101 = f[idx(i1, j0, k1)];
+            float c011 = f[idx(i0, j1, k1)], c111 = f[idx(i1, j1, k1)];
+            return glm::mix(glm::mix(glm::mix(c000, c100, fi), glm::mix(c010, c110, fi), fj),
+                            glm::mix(glm::mix(c001, c101, fi), glm::mix(c011, c111, fi), fj), fk);
+        };
+        return {sample(x), sample(y), sample(z)};
+    }
+
+    void advectVelocity(float dt)
+    {
+        parallelFor(static_cast<int>(cellCount()), [&](int c) {
+            if (solid_[c]) {
+                u2_[c] = u_[c];
+                v2_[c] = v_[c];
+                w2_[c] = w_[c];
+                return;
+            }
+            int i = c % nx_;
+            int j = (c / nx_) % ny_;
+            int k = c / (nx_ * ny_);
+            float gi = i - (u_[c] * dt) / dx_;
+            float gj = j - (v_[c] * dt) / dy_;
+            float gk = k - (w_[c] * dt) / dz_;
+            glm::vec3 vel = trilinearVec(u_, v_, w_, gi, gj, gk);
+            u2_[c] = vel.x;
+            v2_[c] = vel.y;
+            w2_[c] = vel.z;
+        });
+        u_.swap(u2_);
+        v_.swap(v2_);
+        w_.swap(w2_);
+    }
+
     void advectField(const std::vector<float>& src, std::vector<float>& dst, float dt, float extraVy, bool reverse) const
     {
         float sign = reverse ? 1.0f : -1.0f;
@@ -782,6 +862,17 @@ private:
 
     void integrate(float dt, const WeatherParams& p, const glm::vec3& sunDir)
     {
+        using clock = std::chrono::steady_clock;
+        auto stepStart = clock::now();
+        auto mark = stepStart;
+        WeatherTimings pass{};
+        auto elapsed = [&] {
+            auto now = clock::now();
+            float ms = std::chrono::duration<float, std::milli>(now - mark).count();
+            mark = now;
+            return ms;
+        };
+
         glm::vec3 wind = windVector(p);
 
         // 1. Body forces: buoyancy on vertical velocity + interior wind relaxation + drag.
@@ -834,27 +925,28 @@ private:
 
         // 2. Surface energy: shadowed solar heating / IR cooling -> drives slope winds.
         surfaceForcing(dt, p, sunDir);
+        pass.forceMs = elapsed();
 
         // 3. Advect velocity (semi-Lagrangian).
-        semiLagrangian(u_, u2_, dt, 0.0f);
-        semiLagrangian(v_, v2_, dt, 0.0f);
-        semiLagrangian(w_, w2_, dt, 0.0f);
-        u_.swap(u2_); v_.swap(v2_); w_.swap(w2_);
+        advectVelocity(dt);
 
         // 4. Advect scalars.
         macCormackAdvect(theta_, s2_, dt, 0.0f); theta_.swap(s2_);
         macCormackAdvect(qv_, s2_, dt, 0.0f); qv_.swap(s2_);
         macCormackAdvect(qc_, s2_, dt, 0.0f); qc_.swap(s2_);
         macCormackAdvect(qr_, s2_, dt, -p.rainFall); qr_.swap(s2_); // rain falls
+        pass.advectMs = elapsed();
 
         // 5. Boundaries before projection.
         applyInflow(p);
 
         // 6. Microphysics (condensation/evaporation/autoconversion/rain evap) + precip.
         microphysics(dt, p);
+        pass.microMs = elapsed();
 
         // 7. Pressure projection -> divergence free.
         project(dt, p);
+        pass.projectMs = elapsed();
 
         // 8. Rigid lid: no flow through the top boundary (kills top-corner artifacts).
         parallelFor(nx_ * nz_, [&](int col) {
@@ -866,8 +958,9 @@ private:
         // 9. Sub-grid mixing (poor-man's Smagorinsky) damps grid-scale noise. Kept light so
         //    eddies and convective cells survive and keep visibly evolving rather than being
         //    smoothed into a static blanket.
-        diffuse(u_, 0.022f); diffuse(v_, 0.022f); diffuse(w_, 0.022f);
-        diffuse(theta_, 0.012f); diffuse(qv_, 0.012f);
+        diffuseVelocity(0.022f);
+        diffuseThermo(0.012f);
+        pass.diffuseMs = elapsed();
 
         // 9. Outflow.
         zeroGradientOutflow(p);
@@ -892,6 +985,16 @@ private:
             scrub(qc_[c], 0.0f, 0.05f, 0.0f);
             scrub(qr_[c], 0.0f, 0.05f, 0.0f);
         });
+        float totalMs = std::chrono::duration<float, std::milli>(clock::now() - stepStart).count();
+        {
+            std::lock_guard<std::mutex> lk(timingMtx_);
+            timings_.forceMs = pass.forceMs;
+            timings_.advectMs = pass.advectMs;
+            timings_.microMs = pass.microMs;
+            timings_.projectMs = pass.projectMs;
+            timings_.diffuseMs = pass.diffuseMs;
+            timings_.stepMs = totalMs;
+        }
     }
 
     void diffuse(std::vector<float>& f, float alpha)
@@ -909,10 +1012,82 @@ private:
         f.swap(s2_);
     }
 
+    void diffuseVelocity(float alpha)
+    {
+        parallelFor(static_cast<int>(cellCount()), [&](int c) {
+            if (solid_[c]) {
+                u2_[c] = u_[c];
+                v2_[c] = v_[c];
+                w2_[c] = w_[c];
+                return;
+            }
+            int i = c % nx_, j = (c / nx_) % ny_, k = c / (nx_ * ny_);
+            float su = 0.0f, sv = 0.0f, sw = 0.0f;
+            int n = 0;
+            auto add = [&](bool ok, int nb) {
+                if (!ok || solid_[nb]) return;
+                su += u_[nb];
+                sv += v_[nb];
+                sw += w_[nb];
+                ++n;
+            };
+            add(i + 1 < nx_, idx(i + 1, j, k)); add(i - 1 >= 0, idx(i - 1, j, k));
+            add(j + 1 < ny_, idx(i, j + 1, k)); add(j - 1 >= 0, idx(i, j - 1, k));
+            add(k + 1 < nz_, idx(i, j, k + 1)); add(k - 1 >= 0, idx(i, j, k - 1));
+            if (n > 0) {
+                float invN = 1.0f / static_cast<float>(n);
+                u2_[c] = u_[c] + alpha * (su * invN - u_[c]);
+                v2_[c] = v_[c] + alpha * (sv * invN - v_[c]);
+                w2_[c] = w_[c] + alpha * (sw * invN - w_[c]);
+            } else {
+                u2_[c] = u_[c];
+                v2_[c] = v_[c];
+                w2_[c] = w_[c];
+            }
+        });
+        u_.swap(u2_);
+        v_.swap(v2_);
+        w_.swap(w2_);
+    }
+
+    void diffuseThermo(float alpha)
+    {
+        parallelFor(static_cast<int>(cellCount()), [&](int c) {
+            if (solid_[c]) {
+                advectFwd_[c] = theta_[c];
+                advectBack_[c] = qv_[c];
+                return;
+            }
+            int i = c % nx_, j = (c / nx_) % ny_, k = c / (nx_ * ny_);
+            float st = 0.0f, sq = 0.0f;
+            int n = 0;
+            auto add = [&](bool ok, int nb) {
+                if (!ok || solid_[nb]) return;
+                st += theta_[nb];
+                sq += qv_[nb];
+                ++n;
+            };
+            add(i + 1 < nx_, idx(i + 1, j, k)); add(i - 1 >= 0, idx(i - 1, j, k));
+            add(j + 1 < ny_, idx(i, j + 1, k)); add(j - 1 >= 0, idx(i, j - 1, k));
+            add(k + 1 < nz_, idx(i, j, k + 1)); add(k - 1 >= 0, idx(i, j, k - 1));
+            if (n > 0) {
+                float invN = 1.0f / static_cast<float>(n);
+                advectFwd_[c] = theta_[c] + alpha * (st * invN - theta_[c]);
+                advectBack_[c] = qv_[c] + alpha * (sq * invN - qv_[c]);
+            } else {
+                advectFwd_[c] = theta_[c];
+                advectBack_[c] = qv_[c];
+            }
+        });
+        theta_.swap(advectFwd_);
+        qv_.swap(advectBack_);
+    }
+
     void surfaceForcing(float dt, const WeatherParams& p, const glm::vec3& sunDir)
     {
         float horiz = std::sqrt(sunDir.x * sunDir.x + sunDir.z * sunDir.z) + 1e-4f;
         bool daytime = sunDir.y > 0.02f;
+        if (daytime) updateSurfaceShadows(sunDir, horiz);
         parallelFor(static_cast<int>(static_cast<std::size_t>(nx_) * nz_), [&](int col) {
             int i = col % nx_;
             int k = col / nx_;
@@ -929,8 +1104,7 @@ private:
             float solar = 0.0f;
             if (daytime) {
                 float cosInc = std::max(0.0f, glm::dot(normal, sunDir));
-                float shade = shadowFactor(i, k, sunDir, horiz);
-                solar = p.solarHeating * cosInc * shade;
+                solar = p.solarHeating * cosInc * surfaceShade_[col];
             }
             float ir = p.irCooling; // longwave loss, stronger at night when solar is gone
             theta_[c] += (solar - ir) * dt;
@@ -958,6 +1132,19 @@ private:
                     }
                 }
             }
+        });
+    }
+
+    void updateSurfaceShadows(const glm::vec3& sunDir, float horiz)
+    {
+        glm::vec3 sd = glm::normalize(sunDir);
+        if (!shadeDirty_ && glm::dot(sd, shadeSunDir_) > 0.99996f) return;
+        shadeSunDir_ = sd;
+        shadeDirty_ = false;
+        parallelFor(nx_ * nz_, [&](int col) {
+            int i = col % nx_;
+            int k = col / nx_;
+            surfaceShade_[col] = shadowFactor(i, k, sd, horiz);
         });
     }
 

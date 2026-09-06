@@ -60,6 +60,42 @@ float hg(float mu, float g)
     return (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * mu, 1.5);
 }
 
+float hash31(vec3 p)
+{
+    p = fract(p * vec3(0.1031, 0.11369, 0.13787));
+    p += dot(p, p.yzx + 19.19);
+    return fract((p.x + p.y) * p.z);
+}
+
+float noise3(vec3 p)
+{
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    vec3 w = f * f * (3.0 - 2.0 * f);
+    float n000 = hash31(i + vec3(0, 0, 0));
+    float n100 = hash31(i + vec3(1, 0, 0));
+    float n010 = hash31(i + vec3(0, 1, 0));
+    float n110 = hash31(i + vec3(1, 1, 0));
+    float n001 = hash31(i + vec3(0, 0, 1));
+    float n101 = hash31(i + vec3(1, 0, 1));
+    float n011 = hash31(i + vec3(0, 1, 1));
+    float n111 = hash31(i + vec3(1, 1, 1));
+    return mix(mix(mix(n000, n100, w.x), mix(n010, n110, w.x), w.y),
+               mix(mix(n001, n101, w.x), mix(n011, n111, w.x), w.y), w.z);
+}
+
+float fbm3(vec3 p)
+{
+    float sum = 0.0;
+    float amp = 0.56;
+    for (int i = 0; i < 3; ++i) {
+        sum += noise3(p) * amp;
+        p = p * 2.03 + vec3(11.7, -4.2, 6.1);
+        amp *= 0.5;
+    }
+    return sum;
+}
+
 vec3 aces(vec3 x)
 {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
@@ -88,6 +124,7 @@ void main()
     float densityScale = u.cloudParams.x;
     float sunAbsorb = u.cloudParams.z;
     float coverage = u.cloudParams.w;
+    float detailStrength = clamp(u.shadowParams.w, 0.0, 1.0);
 
     // Jitter the start to break up slice banding.
     float jitter = ign(gl_FragCoord.xy) * stepLen;
@@ -110,8 +147,16 @@ void main()
         // Terrain occlusion: once the ray is underground everything beyond is hidden.
         if (p.y < terrainHeight(p.xz)) break;
 
-        float d = max(0.0, sampleQc(p) * densityScale - coverage);
+        float qc = sampleQc(p);
+        float d = max(0.0, qc * densityScale - coverage);
         if (d <= 0.0) continue;
+        if (detailStrength > 0.001) {
+            float envelope = smoothstep(coverage, coverage + 0.22, qc * densityScale);
+            float curlish = fbm3(p * 0.095 + vec3(0.0, p.y * 0.018, 0.0));
+            float erode = mix(0.82, 1.18, curlish);
+            float edgeFeather = mix(1.0, smoothstep(0.18, 0.92, curlish + envelope * 0.38), detailStrength);
+            d *= mix(1.0, erode * edgeFeather, detailStrength);
+        }
 
         // Short march toward the sun for self-shadowing.
         float ld = 0.0;
