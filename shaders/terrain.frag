@@ -218,8 +218,8 @@ vec3 tintLayer(int layer, vec3 c, vec2 p, float height01, float drainage, float 
     if (layer == 0) {          // rock: grey with a cool cast, strata bands keep a little warmth
         float strata = fbm3(vec2(p.x * 0.08, height01 * 24.0));
         float rl = dot(c, vec3(0.3, 0.59, 0.11));
-        c = mix(vec3(rl), c, 0.35) * vec3(0.86, 0.88, 0.92);
-        c *= mix(0.80, 1.16, strata);
+        c = mix(vec3(rl), c, 0.45) * vec3(0.86, 0.88, 0.92);
+        c *= mix(0.62, 1.30, strata);   // stronger banding: real cliffs alternate pale and dark beds
         c = mix(c, c * vec3(1.06, 1.0, 0.94), strata * 0.3);
     } else if (layer == 1) {   // scree
         float sl = dot(c, vec3(0.3, 0.59, 0.11));
@@ -229,9 +229,9 @@ vec3 tintLayer(int layer, vec3 c, vec2 p, float height01, float drainage, float 
         vec3 tint = mix(vec3(0.86, 0.98, 0.70), vec3(0.92, 0.86, 0.60), dry);
         float gl = dot(c, vec3(0.3, 0.59, 0.11));
         c = mix(vec3(gl), c, 0.78) * tint;
-    } else if (layer == 3) {   // forest floor under canopy
+    } else if (layer == 3) {   // forest floor: leaf litter and dark soil under canopy
         float canopy = fbm3(p * 0.45);
-        c *= vec3(0.22, 0.36, 0.17) * (0.70 + 0.6 * canopy) * (1.0 - drainage * 0.25);
+        c *= vec3(0.52, 0.42, 0.28) * (0.65 + 0.6 * canopy) * (1.0 - drainage * 0.25);
     } else if (layer == 4) {   // snow
         c *= 1.05;
     } else {                   // marsh
@@ -393,7 +393,9 @@ void main()
     float sunVis = sunTerrainShadow(vWorldPos, lightDir) * cloudShadow(vWorldPos, lightDir);
     // Forest canopy blocks most direct sun and part of the sky on the floor beneath it.
     float canopyBlock = smoothstep(0.08, 0.45, forestDensity);
-    sunVis *= 1.0 - canopyBlock * 0.72;
+    // Dappled light: sun reaches the floor in shifting patches between the crowns.
+    float dapple = smoothstep(0.42, 0.72, fbm(p * 2.6 + vec2(u.quality.w * 0.02, 0.0)));
+    sunVis *= mix(1.0, 0.18 + 0.82 * dapple, canopyBlock * 0.9);
     svf *= 1.0 - canopyBlock * 0.45;
 
     // Sky ambient follows the day/night clock, and the moon brightens the night in
@@ -422,7 +424,6 @@ void main()
 
     // Fog with sun-tinted inscatter: haze glows warm when looking toward the sun.
     float dist = length(u.cameraPos.xyz - vWorldPos);
-    fogDensity += forestDensity * 0.0025;   // forest haze under canopy, matched in veg.frag
     float fog = fogDensity <= 0.00001 ? 0.0 : clamp(1.0 - exp(-dist * fogDensity), 0.0, 0.92);
     float sunAmount = max(dot(-viewDir, lightDir), 0.0);
     vec3 fogCol = mix(u.fogColor.xyz, u.sunColor.xyz, 0.55 * pow(sunAmount, 6.0));

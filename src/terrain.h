@@ -27,7 +27,7 @@ struct TerrainSettings {
     float waterLevel = 0.10f;
     float waterTint = 1.10f;
     float sedimentTint = 0.85f;
-    float fogDensity = 0.0012f;
+    float fogDensity = 0.0f;
     float surfaceTempC = 8.0f;
     float sunAzimuth = 42.0f;
     float sunElevation = 34.0f;

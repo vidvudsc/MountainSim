@@ -7,6 +7,8 @@ layout(location = 3) in float vShadow;
 layout(location = 4) in float vHeight01;
 layout(location = 5) in float vType;
 layout(location = 6) in float vFade;
+layout(location = 7) in vec3 vUvLayer;
+layout(location = 8) in float vSub;
 
 layout(set = 0, binding = 0) uniform SceneUniforms {
     mat4 view;
@@ -29,6 +31,7 @@ layout(set = 0, binding = 0) uniform SceneUniforms {
 } u;
 layout(set = 0, binding = 4) uniform sampler2DArray matAlbedo;
 layout(set = 0, binding = 6) uniform sampler2D ecoTex;
+layout(set = 0, binding = 7) uniform sampler2DArray foliageTex;
 
 layout(location = 0) out vec4 outColor;
 const float WS = 165.0;
@@ -41,12 +44,19 @@ void main()
     vec3 L = normalize(u.sunDir.xyz);
     vec3 V = normalize(u.cameraPos.xyz - vWorldPos);
     vec3 n = normalize(vNormal);
-    if (vType >= 2.5 && vType < 5.5 && dot(n, V) < 0.0) n = -n;   // billboards, grass, ferns are two-sided
+    bool textured = vUvLayer.z >= 0.0;
+    if (textured && dot(n, V) < 0.0) n = -n;                       // all cards are two-sided
     if (vType > 3.5 && vType < 5.5) n = normalize(mix(n, vec3(0.0, 1.0, 0.0), 0.6)); // grass/ferns light like the ground
     if (vType > 2.5 && vType < 3.5) n = normalize(vec3(0.0, 1.0, 0.0) * 0.8 + L * 0.35); // far trees: average canopy lighting
 
     vec3 albedo = vColor;
-    bool leaf = (vType < 1.5) && (vColor.g > vColor.r * 1.25);      // tree foliage vs bark
+    if (textured) {
+        vec4 t = texture(foliageTex, vUvLayer);
+        if (t.a < 0.35) discard;
+        albedo = vColor * t.rgb;
+    }
+    bool leaf = textured && (vType < 1.5 || (vType > 2.5 && vType < 3.5));   // tree foliage cards
+    bool birch = (vType < 1.5) && !textured && vColor.r > 0.6;
     bool rockLike = (vType > 1.5 && vType < 2.5) || vType > 5.5 && vType < 6.5;
     if (rockLike) {
         // Boulders: rock photo texture, triplanar, with moss where the surface faces up.
@@ -61,11 +71,18 @@ void main()
         float mossNoise = hash(floor(vWorldPos.xz * 90.0) + floor(vWorldPos.y * 90.0));
         vec3 moss = texture(matAlbedo, vec3(pw.xz * 1.7, 2.0)).rgb * vec3(0.45, 0.85, 0.35);
         albedo = mix(rock, moss, smoothstep(0.35, 0.75, mossAmt + (mossNoise - 0.5) * 0.35));
-    } else if (vType < 1.5 && !leaf) {
-        // Bark: vertical fissures from a cheap stripe hash.
+    } else if ((vType < 1.5 || vType > 9.5) && !textured) {
         float ang = atan(vWorldPos.z * 40.0, vWorldPos.x * 40.0);
-        float stripe = hash(vec2(floor(ang * 5.0), floor(vWorldPos.y * 120.0 + hash(vec2(floor(ang * 5.0))) * 7.0)));
-        albedo *= 0.65 + 0.7 * stripe;
+        if (birch) {
+            // Birch: pale bark with short dark horizontal marks.
+            float mark = hash(vec2(floor(vWorldPos.y * 300.0), floor(ang * 2.5 + vWorldPos.y * 9.0)));
+            float band = hash(vec2(floor(vWorldPos.y * 120.0), 3.0));
+            albedo *= (mark > 0.90) ? 0.30 : (band > 0.93 ? 0.55 : (0.92 + 0.16 * hash(vec2(floor(vWorldPos.y * 40.0), 1.0))));
+        } else {
+            // Bark: vertical fissures from a cheap stripe hash.
+            float stripe = hash(vec2(floor(ang * 5.0), floor(vWorldPos.y * 120.0 + hash(vec2(floor(ang * 5.0))) * 7.0)));
+            albedo *= 0.65 + 0.7 * stripe;
+        }
     }
     float hv = (vType > 2.5 && vType < 3.5) ? 0.5 : hash(floor(vWorldPos.xz * 37.0));
     if (!rockLike) {
@@ -74,26 +91,18 @@ void main()
     }
     float daylight = smoothstep(-0.08, 0.20, L.y);
     vec3 ambient = mix(vec3(0.020, 0.028, 0.048), vec3(0.15, 0.18, 0.22), daylight) * (0.6 + 0.4 * clamp(n.y, 0.0, 1.0));
-    if (leaf && dot(n, V) < 0.0) n = -n;
     float NoL = clamp(dot(n, L) * 0.7 + 0.3, 0.0, 1.0);
     float ao = mix(vType > 3.5 ? 0.55 : 0.45, 1.0, vHeight01);
     vec3 color = albedo * (ambient * 0.85 + u.sunColor.xyz * NoL * vShadow * 0.62) * ao;
     // Thin foliage lets light through: backlit leaves and blades glow.
-    if (leaf || (vType > 3.5 && vType < 5.5) || vType > 6.5) {
+    if (textured && vType < 9.5) {
         float through = pow(clamp(dot(V, L), 0.0, 1.0), 3.0);
         color += albedo * vec3(1.0, 1.0, 0.7) * u.sunColor.xyz * through * vShadow * (leaf ? 0.5 : 0.12);
     }
-    // Forest haze: denser air under canopy so trunks recede into mist.
-    float haze = 0.0;
-    {
-        float R = u.material.w;
-        vec2 rel = clamp((vWorldPos.xz + WS * 0.5) / WS, 0.0, 1.0);
-        vec2 tc = (rel * (R - 1.0) + 0.5) / R;
-        haze = texture(ecoTex, tc).b;
-    }
+
 
     float dist = length(u.cameraPos.xyz - vWorldPos);
-    float fogDensity = u.terrain.w + haze * 0.0025;
+    float fogDensity = u.terrain.w;
     float fog = fogDensity <= 0.00001 ? 0.0 : clamp(1.0 - exp(-dist * fogDensity), 0.0, 0.92);
     float sunAmount = max(dot(-V, L), 0.0);
     vec3 fogCol = mix(u.fogColor.xyz, u.sunColor.xyz, 0.55 * pow(sunAmount, 6.0));

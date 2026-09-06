@@ -5,6 +5,7 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec3 inColor;
 layout(location = 3) in vec4 inPosScale;   // per instance
 layout(location = 4) in vec4 inRotType;    // per instance
+layout(location = 5) in vec4 inUvLayer;
 
 layout(set = 0, binding = 0) uniform SceneUniforms {
     mat4 view;
@@ -36,6 +37,8 @@ layout(location = 3) out float vShadow;
 layout(location = 4) out float vHeight01;
 layout(location = 5) out float vType;
 layout(location = 6) out float vFade;
+layout(location = 7) out vec3 vUvLayer;
+layout(location = 8) out float vSub;
 
 const float WS = 165.0;
 
@@ -82,7 +85,7 @@ void main()
         if (t < 1.5) {          // trees: crown sways, trunk base fixed
             amp = (s / 60.0) * 0.025;               // crown moves ~2.5% of the tree height
             flutter = sin(time * 2.1 + hash2(inPosScale.xz) * 6.28 + inPosition.y * 60.0 * 0.4) * 0.25;
-        } else if (t > 3.5 && t < 5.5 || t > 6.5) {   // grass, ferns, flowers
+        } else if ((t > 3.5 && t < 5.5) || (t > 6.5 && t < 7.5)) {   // grass, ferns, flowers
             amp = 0.0045;
             flutter = sin(time * 3.3 + hash2(inPosScale.xz) * 6.28) * 0.6;
         } else { amp = 0.0; flutter = 0.0; }
@@ -94,13 +97,13 @@ void main()
     vNormal = normalize(vec3(c * n.x + sn * n.z, n.y, -sn * n.x + c * n.z));
     vWorldPos = world;
     vColor = inColor;
-    // Billboards: colour by tree subtype so the far LOD matches the near meshes' average tone.
-    if (inRotType.y > 2.5 && inRotType.y < 3.5) {
-        vColor = (inRotType.w < 0.5) ? vec3(0.10, 0.17, 0.09) : vec3(0.13, 0.22, 0.11);
-    }
+    // Billboards: tint by tree subtype (0 conifer darker, 1 broadleaf).
+    if (inRotType.y > 2.5 && inRotType.y < 3.5) vColor = (inRotType.w < 0.5) ? vec3(0.55, 0.62, 0.55) : vec3(0.95, 0.95, 0.9);
     vHeight01 = clamp(inPosition.y * 60.0, 0.0, 1.0);   // unit object is 1 m tall (1/kMetersPerUnit units)
     vType = inRotType.y;
     vFade = inRotType.z;
+    vUvLayer = inUvLayer.xyz;
+    vSub = inRotType.w;
     // Far billboards: cheap 4-step march; meshes get the full one.
     vec3 sd = normalize(u.sunDir.xyz);
     if (inRotType.y > 2.5 && inRotType.y < 3.5) {

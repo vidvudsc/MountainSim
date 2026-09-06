@@ -126,6 +126,10 @@ private:
     std::array<VkDeviceMemory, kMaxFramesInFlight> vegInstanceMemories_{};
     std::array<void*, kMaxFramesInFlight> vegInstanceMapped_{};
     std::array<Vegetation::DrawGroups, kMaxFramesInFlight> vegGroups_{};
+    VkImage folImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory folMemory_ = VK_NULL_HANDLE;
+    VkImageView folView_ = VK_NULL_HANDLE;
+    VkSampler folSampler_ = VK_NULL_HANDLE;
     float texMacro_ = 9.0f;   // world units per repeat of the large tile
     float texMid_ = 1.2f;
     float texNear_ = 0.22f;
@@ -317,6 +321,7 @@ private:
         createCommandPool();
         createSkyboxResources();
         createTerrainTextures();
+        createFoliageTexture();
         createEcoTexture();
         createTerrainBuffers();
         veg_.place(terrain_, terrain_.settings().seed);
@@ -657,7 +662,9 @@ private:
         matNor.binding = 5;
         VkDescriptorSetLayoutBinding eco = matAlb;
         eco.binding = 6;
-        std::array<VkDescriptorSetLayoutBinding, 7> bindings{ubo, skybox, cloudVol, heightMap, matAlb, matNor, eco};
+        VkDescriptorSetLayoutBinding fol = matAlb;
+        fol.binding = 7;
+        std::array<VkDescriptorSetLayoutBinding, 8> bindings{ubo, skybox, cloudVol, heightMap, matAlb, matNor, eco, fol};
         VkDescriptorSetLayoutCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         createInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
@@ -772,12 +779,13 @@ private:
             {0, sizeof(VegVertex), VK_VERTEX_INPUT_RATE_VERTEX},
             {1, sizeof(VegInstanceGpu), VK_VERTEX_INPUT_RATE_INSTANCE},
         }};
-        std::array<VkVertexInputAttributeDescription, 5> attributes{{
+        std::array<VkVertexInputAttributeDescription, 6> attributes{{
             {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VegVertex, position)},
             {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VegVertex, normal)},
             {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VegVertex, color)},
             {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VegInstanceGpu, posScale)},
             {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VegInstanceGpu, rotType)},
+            {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VegVertex, uvLayer)},
         }};
         VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         vertexInput.vertexBindingDescriptionCount = static_cast<std::uint32_t>(bindings.size());
@@ -795,6 +803,7 @@ private:
         raster.lineWidth = 1.0f;
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         multisample.rasterizationSamples = kMsaaSamples;
+        multisample.alphaToCoverageEnable = VK_TRUE;   // soft cutout edges on foliage cards
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         depth.depthTestEnable = VK_TRUE; depth.depthWriteEnable = VK_TRUE; depth.depthCompareOp = VK_COMPARE_OP_LESS;
         VkPipelineColorBlendAttachmentState blendAttachment{};
@@ -856,7 +865,7 @@ private:
     void drawVegetation(VkCommandBuffer cmd)
     {
         const Vegetation::DrawGroups& g = vegGroups_[currentFrame_];
-        std::uint32_t total = g.coniferMid[1] + g.broadleafMid[1] + g.boulder[1] + g.billboard[1] + g.grass[1] + g.fern[1] + g.mossRock[1] + g.flower[1];
+        std::uint32_t total = g.coniferMid[1] + g.broadleafMid[1] + g.dead[1] + g.boulder[1] + g.billboard[1] + g.grass[1] + g.fern[1] + g.mossRock[1] + g.flower[1] + g.mushroom[1] + g.litter[1];
         for (int v = 0; v < Vegetation::kVariants; ++v) total += g.conifer[v][1] + g.broadleaf[v][1];
         if (!showVegetation_ || total == 0) return;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vegPipeline_);
@@ -872,12 +881,15 @@ private:
         for (int v = 0; v < Vegetation::kVariants; ++v) { draw(veg_.conifer[v], g.conifer[v]); draw(veg_.broadleaf[v], g.broadleaf[v]); }
         draw(veg_.coniferMid, g.coniferMid);
         draw(veg_.broadleafMid, g.broadleafMid);
+        draw(veg_.deadTree, g.dead);
         draw(veg_.boulder, g.boulder);
         draw(veg_.billboard, g.billboard);
         draw(veg_.grass, g.grass);
         draw(veg_.fern, g.fern);
         draw(veg_.mossRock, g.mossRock);
         draw(veg_.flower, g.flower);
+        draw(veg_.mushroom, g.mushroom);
+        draw(veg_.litter, g.litter);
     }
 
     void createSkyPipeline()
@@ -1686,6 +1698,89 @@ private:
         checkVk(vkCreateImageView(device_, &vi, nullptr, &view), "Failed to create material array view");
     }
 
+    // Same as createMaterialArray but from in-memory RGBA8 layers of equal size.
+    void createArrayFromPixels(const std::uint8_t* pixels, int W, int H, std::uint32_t layers, VkFormat format,
+                               VkImage& image, VkDeviceMemory& memory, VkImageView& view)
+    {
+        VkDeviceSize layerBytes = static_cast<VkDeviceSize>(W) * H * 4;
+        VkBuffer staging = VK_NULL_HANDLE;
+        VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+        createBuffer(layerBytes * layers, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMemory);
+        void* mapped = nullptr;
+        vkMapMemory(device_, stagingMemory, 0, layerBytes * layers, 0, &mapped);
+        std::memcpy(mapped, pixels, static_cast<std::size_t>(layerBytes * layers));
+        vkUnmapMemory(device_, stagingMemory);
+        std::uint32_t mips = 1 + static_cast<std::uint32_t>(std::floor(std::log2(std::max(W, H))));
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.extent = {static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(H), 1};
+        ii.mipLevels = mips; ii.arrayLayers = layers; ii.format = format;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        checkVk(vkCreateImage(device_, &ii, nullptr, &image), "Failed to create array image");
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(device_, image, &req);
+        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        checkVk(vkAllocateMemory(device_, &alloc, nullptr, &memory), "Failed to allocate array memory");
+        vkBindImageMemory(device_, image, memory, 0);
+        VkCommandBuffer cmd = beginSingleTimeCommands();
+        auto barrier = [&](std::uint32_t baseMip, std::uint32_t mipCount, VkImageLayout oldL, VkImageLayout newL,
+                           VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = oldL; b.newLayout = newL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = image;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, baseMip, mipCount, 0, layers};
+            b.srcAccessMask = srcA; b.dstAccessMask = dstA;
+            vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+        };
+        barrier(0, mips, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
+        region.imageExtent = {static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(H), 1};
+        vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        int mipW = W, mipH = H;
+        for (std::uint32_t i = 1; i < mips; ++i) {
+            barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, layers};
+            blit.srcOffsets[1] = {mipW, mipH, 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, layers};
+            blit.dstOffsets[1] = {std::max(mipW / 2, 1), std::max(mipH / 2, 1), 1};
+            vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+            barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            mipW = std::max(mipW / 2, 1); mipH = std::max(mipH / 2, 1);
+        }
+        barrier(mips - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        endSingleTimeCommands(cmd);
+        vkDestroyBuffer(device_, staging, nullptr);
+        vkFreeMemory(device_, stagingMemory, nullptr);
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; vi.format = format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
+        checkVk(vkCreateImageView(device_, &vi, nullptr, &view), "Failed to create array view");
+    }
+
+    // Procedurally painted foliage atlas (leaf clusters, grass, fern, litter, birch, needles).
+    void createFoliageTexture()
+    {
+        std::vector<std::uint8_t> px = Vegetation::paintFoliageAtlas();
+        createArrayFromPixels(px.data(), kFoliageTexSize, kFoliageTexSize, FOL_COUNT, VK_FORMAT_R8G8B8A8_SRGB, folImage_, folMemory_, folView_);
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = VK_FILTER_LINEAR; si.minFilter = VK_FILTER_LINEAR;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = 4.0f;
+        si.maxLod = VK_LOD_CLAMP_NONE;
+        checkVk(vkCreateSampler(device_, &si, nullptr, &folSampler_), "Failed to create foliage sampler");
+    }
+
     void createTerrainTextures()
     {
         const std::array<std::string, kMatLayers> names{
@@ -1891,7 +1986,7 @@ private:
     {
         std::array<VkDescriptorPoolSize, 2> poolSizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 * kMaxFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 7 * kMaxFramesInFlight},
         }};
         VkDescriptorPoolCreateInfo createInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         createInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
@@ -1920,14 +2015,15 @@ private:
             VkDescriptorImageInfo albInfo{matSampler_, matAlbedoView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkDescriptorImageInfo norInfo{matSampler_, matNormalView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkDescriptorImageInfo ecoInfo{ecoSampler_, ecoView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            std::array<VkWriteDescriptorSet, 7> writes{};
-            for (std::uint32_t b = 4; b <= 6; ++b) {
+            VkDescriptorImageInfo folInfo{folSampler_, folView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            std::array<VkWriteDescriptorSet, 8> writes{};
+            for (std::uint32_t b = 4; b <= 7; ++b) {
                 writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[b].dstSet = descriptorSets_[i];
                 writes[b].dstBinding = b;
                 writes[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 writes[b].descriptorCount = 1;
-                writes[b].pImageInfo = (b == 4) ? &albInfo : (b == 5) ? &norInfo : &ecoInfo;
+                writes[b].pImageInfo = (b == 4) ? &albInfo : (b == 5) ? &norInfo : (b == 6) ? &ecoInfo : &folInfo;
             }
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = descriptorSets_[i];
@@ -2087,7 +2183,13 @@ private:
         float half = kTerrainWorldSize * 0.5f - 0.5f;
         camera_.position.x = glm::clamp(camera_.position.x, -half, half);
         camera_.position.z = glm::clamp(camera_.position.z, -half, half);
-        float eye = terrain_.surfaceHeightAtWorld(camera_.position.x, camera_.position.z) + 1.75f / kMetersPerUnit;
+        float footprint = 1.2f / kMetersPerUnit;
+        float g0 = terrain_.surfaceHeightAtWorld(camera_.position.x, camera_.position.z);
+        float g1 = terrain_.surfaceHeightAtWorld(camera_.position.x + footprint, camera_.position.z);
+        float g2 = terrain_.surfaceHeightAtWorld(camera_.position.x - footprint, camera_.position.z);
+        float g3 = terrain_.surfaceHeightAtWorld(camera_.position.x, camera_.position.z + footprint);
+        float g4 = terrain_.surfaceHeightAtWorld(camera_.position.x, camera_.position.z - footprint);
+        float eye = std::max({g0, g1, g2, g3, g4}) + 2.3f / kMetersPerUnit;
         if (!flying || camera_.position.y < eye) camera_.position.y = glm::mix(camera_.position.y, eye, flying ? 1.0f : glm::clamp(dt * 12.0f, 0.0f, 1.0f));
         if (!flying) camera_.position.y = std::max(camera_.position.y, eye);
         camera_.target = camera_.position + fwd;
@@ -3215,6 +3317,10 @@ private:
         if (matNormalMemory_) vkFreeMemory(device_, matNormalMemory_, nullptr);
         destroyEcoTexture();
         if (ecoSampler_) vkDestroySampler(device_, ecoSampler_, nullptr);
+        if (folSampler_) vkDestroySampler(device_, folSampler_, nullptr);
+        if (folView_) vkDestroyImageView(device_, folView_, nullptr);
+        if (folImage_) vkDestroyImage(device_, folImage_, nullptr);
+        if (folMemory_) vkFreeMemory(device_, folMemory_, nullptr);
         vkDestroySampler(device_, skyboxSampler_, nullptr);
         vkDestroyImageView(device_, skyboxView_, nullptr);
         vkDestroyImage(device_, skyboxImage_, nullptr);

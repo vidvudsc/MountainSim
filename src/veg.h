@@ -1,8 +1,9 @@
 #pragma once
 
-// Vegetation: trees and boulders placed from the terrain's ecology maps and drawn as GPU
-// instances with distance LOD, plus grass tufts generated around the camera each frame.
-// World unit = kMetersPerUnit metres on all axes.
+// Vegetation: trees, boulders, undergrowth placed from the terrain's ecology maps and drawn
+// as GPU instances with distance LOD. Foliage uses procedurally painted alpha-cut textures
+// (leaf clusters, grass, fern fronds, needle sprays, litter) so one card carries a whole
+// cluster. World unit = kMetersPerUnit metres on all axes.
 
 #include "common.h"
 #include "terrain.h"
@@ -19,12 +20,15 @@ struct VegVertex {
     glm::vec3 position{};
     glm::vec3 normal{};
     glm::vec3 color{};
+    glm::vec4 uvLayer{0.0f, 0.0f, -1.0f, 0.0f};   // xy uv, z foliage atlas layer (-1 = plain colour), w unused
 };
 
 struct VegInstanceGpu {
-    glm::vec4 posScale{};   // xyz world position, w = height in metres
-    glm::vec4 rotType{};    // x rotation, y type (0 conifer 1 broadleaf 2 boulder 3 billboard 4 grass), z fade, w unused
+    glm::vec4 posScale{};   // xyz world position, w = scale in metres
+    glm::vec4 rotType{};    // x rotation, y type, z fade, w subtype
 };
+// Instance types: 0 conifer, 1 broadleaf, 2 boulder, 3 billboard, 4 grass, 5 fern, 6 moss rock,
+// 7 flower, 8 mushroom, 9 litter, 10 dead tree.
 
 struct VegMeshRange {
     std::uint32_t firstIndex = 0;
@@ -32,30 +36,173 @@ struct VegMeshRange {
     std::int32_t vertexOffset = 0;
 };
 
+// Foliage atlas layers.
+enum FoliageLayer : int { FOL_LEAF = 0, FOL_GRASS = 1, FOL_FERN = 2, FOL_LITTER = 3, FOL_BIRCH = 4, FOL_NEEDLE = 5, FOL_COUNT = 6 };
+constexpr int kFoliageTexSize = 512;
+
 class Vegetation {
 public:
     static constexpr int kSub = 32;                  // terrain cells per sub-chunk
-    static constexpr float kRMesh = 22.0f;           // full meshes within this (world units)
-    static constexpr std::uint32_t kMaxInstances = 420000;
+    static constexpr float kRMesh = 24.0f;           // mid meshes out to here (world units)
+    static constexpr float kRNear = 8.0f;            // full meshes within ~480 m
+    static constexpr std::uint32_t kMaxInstances = 520000;
+    static constexpr int kVariants = 3;
 
     struct Instance { float x, y, z, scale, rot; std::uint8_t type; };
     struct Range { int start = 0, count = 0; };
 
-    // ---- meshes (built once) -------------------------------------------------------------
     std::vector<VegVertex> vertices;
     std::vector<std::uint32_t> indices;
-    static constexpr int kVariants = 3;
-    VegMeshRange conifer[kVariants], broadleaf[kVariants], coniferMid, broadleafMid;
-    VegMeshRange boulder, billboard, grass, fern, mossRock, flower;
-    static constexpr float kRNear = 7.0f;            // full tree meshes within ~420 m
+    VegMeshRange conifer[kVariants], broadleaf[kVariants], coniferMid, broadleafMid, deadTree;
+    VegMeshRange boulder, billboard, grass, fern, mossRock, flower, mushroom, litter;
 
-    // ---- placement -------------------------------------------------------------------------
     std::vector<Instance> trees, rocks;
     std::vector<Range> treeRanges, rockRanges;
     int gridN = 0;
 
     Vegetation() { buildMeshes(); }
 
+    // ---- procedurally painted foliage atlas ------------------------------------------------
+    // RGBA8, kFoliageTexSize square, FOL_COUNT layers. Alpha is the cutout.
+    static std::vector<std::uint8_t> paintFoliageAtlas()
+    {
+        const int S = kFoliageTexSize;
+        std::vector<std::uint8_t> px(static_cast<std::size_t>(S) * S * 4 * FOL_COUNT, 0);
+        std::uint32_t rng = 1234567u;
+        auto rnd = [&]() { rng = rng * 1664525u + 1013904223u; return (rng >> 8) / 16777216.0f; };
+        auto put = [&](int layer, int x, int y, glm::vec3 c, float a) {
+            if (x < 0 || y < 0 || x >= S || y >= S) return;
+            std::uint8_t* p = &px[((static_cast<std::size_t>(layer) * S + y) * S + x) * 4];
+            float oldA = p[3] / 255.0f;
+            float na = std::max(oldA, a);
+            // painter's order: later shapes cover earlier ones
+            p[0] = static_cast<std::uint8_t>(glm::clamp(c.r * 255.0f, 0.0f, 255.0f));
+            p[1] = static_cast<std::uint8_t>(glm::clamp(c.g * 255.0f, 0.0f, 255.0f));
+            p[2] = static_cast<std::uint8_t>(glm::clamp(c.b * 255.0f, 0.0f, 255.0f));
+            p[3] = static_cast<std::uint8_t>(na * 255.0f);
+        };
+        // Rotated ellipse with a darker mid-vein and lighter rim.
+        auto leaf = [&](int layer, float cx, float cy, float len, float wid, float ang, glm::vec3 col, bool pointed) {
+            float ca = std::cos(ang), sa = std::sin(ang);
+            int r = static_cast<int>(std::max(len, wid)) + 2;
+            for (int y = static_cast<int>(cy) - r; y <= static_cast<int>(cy) + r; ++y) {
+                for (int x = static_cast<int>(cx) - r; x <= static_cast<int>(cx) + r; ++x) {
+                    float dx = x - cx, dy = y - cy;
+                    float u = (dx * ca + dy * sa) / len;       // along
+                    float v = (-dx * sa + dy * ca) / wid;      // across
+                    float w = pointed ? (1.0f - std::abs(u)) * 1.15f : std::sqrt(std::max(0.0f, 1.0f - u * u));
+                    if (std::abs(u) > 1.0f || std::abs(v) > w) continue;
+                    float edge = 1.0f - std::abs(v) / std::max(w, 0.01f);
+                    float vein = std::exp(-std::abs(v) * 40.0f) * 0.35f;
+                    glm::vec3 c = col * (0.85f + 0.3f * edge) * (1.0f - vein) * (0.9f + 0.2f * (0.5f + 0.5f * u));
+                    put(layer, x, y, c, 1.0f);
+                }
+            }
+        };
+        // Tapered curved blade from (x0,y0) upward.
+        auto blade = [&](int layer, float x0, float y0, float h, float w, float curve, glm::vec3 base, glm::vec3 tip) {
+            int steps = static_cast<int>(h);
+            for (int i = 0; i <= steps; ++i) {
+                float t = i / static_cast<float>(steps);
+                float x = x0 + curve * t * t * 60.0f;
+                float y = y0 - t * h;
+                float hw = w * (1.0f - t) * 0.5f + 0.4f;
+                glm::vec3 c = glm::mix(base, tip, t);
+                for (int k = static_cast<int>(x - hw); k <= static_cast<int>(x + hw); ++k) put(layer, k, static_cast<int>(y), c, 1.0f);
+            }
+        };
+
+        // FOL_LEAF: a cluster of broad leaves, more toward the centre.
+        for (int i = 0; i < 44; ++i) {
+            float a = rnd() * 6.2831853f, r = std::pow(rnd(), 0.6f) * S * 0.42f;
+            glm::vec3 col{0.16f + rnd() * 0.08f, 0.34f + rnd() * 0.14f, 0.12f + rnd() * 0.06f};
+            leaf(FOL_LEAF, S * 0.5f + std::cos(a) * r, S * 0.5f + std::sin(a) * r, S * (0.07f + rnd() * 0.05f), S * (0.035f + rnd() * 0.02f), rnd() * 6.28f, col, true);
+        }
+        // FOL_BIRCH: small rounder lighter leaves, sparser.
+        for (int i = 0; i < 60; ++i) {
+            float a = rnd() * 6.2831853f, r = std::pow(rnd(), 0.6f) * S * 0.44f;
+            glm::vec3 col{0.28f + rnd() * 0.1f, 0.48f + rnd() * 0.15f, 0.16f + rnd() * 0.06f};
+            leaf(FOL_BIRCH, S * 0.5f + std::cos(a) * r, S * 0.5f + std::sin(a) * r, S * (0.035f + rnd() * 0.02f), S * (0.028f + rnd() * 0.012f), rnd() * 6.28f, col, false);
+        }
+        // FOL_GRASS: many blades rooted along the bottom edge.
+        for (int i = 0; i < 70; ++i) {
+            float x0 = S * (0.08f + rnd() * 0.84f);
+            float h = S * (0.35f + rnd() * 0.6f);
+            glm::vec3 base{0.08f, 0.16f, 0.05f}, tip{0.24f + rnd() * 0.1f, 0.40f + rnd() * 0.1f, 0.14f};
+            blade(FOL_GRASS, x0, S - 1.0f, h, S * 0.012f, (rnd() - 0.5f) * 1.4f, base, tip);
+        }
+        // FOL_FERN: a frond, stem up the middle with paired leaflets shrinking to the tip; each
+        // leaflet made of small serrated sub-leaflets.
+        {
+            glm::vec3 stem{0.20f, 0.30f, 0.10f};
+            for (int y = S - 4; y > S * 0.06f; --y) for (int k = -2; k <= 2; ++k) put(FOL_FERN, S / 2 + k, y, stem, 1.0f);
+            int pairs = 15;
+            for (int p = 0; p < pairs; ++p) {
+                float t = p / static_cast<float>(pairs - 1);
+                float y = S * 0.94f - t * S * 0.86f;
+                float len = S * 0.44f * std::sin(t * 2.6f + 0.35f) * (1.0f - t * 0.55f) + S * 0.03f;
+                for (int side = -1; side <= 1; side += 2) {
+                    float ang = side * (0.35f + 0.25f * t) - 0.05f;   // leaflets angle up toward the tip
+                    int subs = 7;
+                    for (int q = 0; q <= subs; ++q) {
+                        float u = q / static_cast<float>(subs);
+                        float lx = S * 0.5f + side * u * len * std::cos(ang);
+                        float ly = y - u * len * std::sin(std::abs(ang)) * 0.55f;
+                        float subLen = S * 0.028f * (1.0f - u * 0.6f) + 3.0f;
+                        glm::vec3 col{0.14f + rnd() * 0.05f, 0.32f + rnd() * 0.1f, 0.11f};
+                        leaf(FOL_FERN, lx, ly - subLen * 0.4f, subLen, subLen * 0.45f, 1.5708f + side * 0.6f, col, true);
+                        leaf(FOL_FERN, lx, ly + subLen * 0.4f, subLen, subLen * 0.45f, 1.5708f - side * 0.6f, col, true);
+                    }
+                    // leaflet midrib
+                    int segs = static_cast<int>(len);
+                    for (int i = 0; i < segs; ++i) {
+                        float u = i / static_cast<float>(std::max(segs, 1));
+                        put(FOL_FERN, static_cast<int>(S * 0.5f + side * u * len * std::cos(ang)), static_cast<int>(y - u * len * std::sin(std::abs(ang)) * 0.55f), stem, 1.0f);
+                    }
+                }
+            }
+        }
+        // FOL_LITTER: fallen leaves in browns and ochres, sparse.
+        for (int i = 0; i < 38; ++i) {
+            float x = rnd() * S, y = rnd() * S;
+            float h = rnd();
+            glm::vec3 col = glm::mix(glm::vec3(0.45f, 0.30f, 0.14f), glm::vec3(0.62f, 0.46f, 0.20f), h);
+            if (rnd() < 0.25f) col = glm::vec3(0.30f, 0.36f, 0.14f);
+            leaf(FOL_LITTER, x, y, S * (0.05f + rnd() * 0.04f), S * (0.03f + rnd() * 0.015f), rnd() * 6.28f, col, true);
+        }
+        // FOL_NEEDLE: a spruce spray, central twig with dense short needles either side, tapering.
+        {
+            glm::vec3 twig{0.22f, 0.16f, 0.10f};
+            for (int y = S - 3; y > S * 0.05f; --y) put(FOL_NEEDLE, S / 2, y, twig, 1.0f), put(FOL_NEEDLE, S / 2 + 1, y, twig, 1.0f);
+            for (int i = 0; i < 260; ++i) {
+                float t = rnd();
+                float y = S * 0.96f - t * S * 0.9f;
+                float len = S * (0.09f + 0.16f * (1.0f - t)) * (0.7f + rnd() * 0.3f);
+                float side = rnd() < 0.5f ? -1.0f : 1.0f;
+                float ang = side * (0.9f + rnd() * 0.5f);
+                glm::vec3 col{0.07f + rnd() * 0.05f, 0.20f + rnd() * 0.10f, 0.09f + rnd() * 0.04f};
+                leaf(FOL_NEEDLE, S * 0.5f + std::cos(ang) * len * 0.5f, y - std::sin(std::abs(ang)) * len * 0.15f, len * 0.5f, 2.2f, ang, col, true);
+            }
+            // side twigs with their own needles
+            for (int b = 0; b < 8; ++b) {
+                float t = 0.15f + b * 0.1f;
+                float y0 = S * 0.94f - t * S * 0.86f;
+                float side = (b % 2) ? 1.0f : -1.0f;
+                float len = S * 0.3f * (1.0f - t * 0.5f);
+                for (int i = 0; i < 60; ++i) {
+                    float u = rnd();
+                    float x = S * 0.5f + side * u * len, y = y0 - u * len * 0.35f;
+                    float nl = S * 0.06f * (0.6f + rnd() * 0.4f);
+                    float ang = (rnd() < 0.5f ? -1.0f : 1.0f) * (1.1f + rnd() * 0.4f);
+                    glm::vec3 col{0.08f + rnd() * 0.04f, 0.21f + rnd() * 0.08f, 0.10f};
+                    leaf(FOL_NEEDLE, x + std::cos(ang) * nl * 0.5f, y - std::sin(std::abs(ang)) * nl * 0.3f, nl * 0.5f, 2.0f, ang, col, true);
+                }
+            }
+        }
+        return px;
+    }
+
+    // ---- placement ---------------------------------------------------------------------------
     void place(const Terrain& terrain, int seed)
     {
         rng_ = static_cast<std::uint32_t>(seed) * 2654435761u + 97u;
@@ -69,10 +216,8 @@ public:
         float span = std::max(maxH - minH, 0.001f);
         float cell = kTerrainWorldSize / static_cast<float>(N - 1);
         float cellMeters = cell * kMetersPerUnit;
-        // ~10 m spacing in dense forest
-        float maxTreesPerCell = std::max(0.5f, (cellMeters * cellMeters) / (10.0f * 10.0f));
+        float maxTreesPerCell = std::max(0.5f, (cellMeters * cellMeters) / (8.5f * 8.5f));
 
-        // Widened water mask: no trees or boulders in pools or along channels.
         std::vector<float> wet = terrain.waterMap();
         if (wet.size() == static_cast<std::size_t>(N * N)) {
             std::vector<float> tmp(wet.size());
@@ -94,9 +239,10 @@ public:
             float fl = flowM.empty() ? 0.0f : flowM[i];
             return w > 0.10f || fl > 0.68f;
         };
+
         struct Keyed { int key; Instance inst; };
         std::vector<Keyed> kt, kr;
-        kt.reserve(600000);
+        kt.reserve(800000);
         kr.reserve(80000);
         for (int z = 0; z < N; ++z) {
             for (int x = 0; x < N; ++x) {
@@ -117,8 +263,9 @@ public:
                         float wy = terrain.surfaceHeightAtWorld(wx, wz);
                         float coniferP = glm::clamp((hN - 0.20f) / 0.20f, 0.0f, 1.0f);
                         std::uint8_t type = (rand01() < coniferP) ? 0 : 1;
-                        float height = (type == 0) ? 18.0f + rand01() * 14.0f : 12.0f + rand01() * 9.0f;
+                        float height = (type == 0) ? 20.0f + rand01() * 16.0f : 14.0f + rand01() * 12.0f;
                         height *= 0.75f + 0.25f * density;
+                        if (rand01() < 0.035f) { type = 10; height *= 0.7f; }   // dead snag
                         kt.push_back({key, {wx, wy, wz, height, rand01() * 6.2831853f, type}});
                     }
                 }
@@ -132,7 +279,7 @@ public:
                         float fx = x + rand01(), fz = z + rand01();
                         float wx = (fx / (N - 1) - 0.5f) * kTerrainWorldSize;
                         float wz = (fz / (N - 1) - 0.5f) * kTerrainWorldSize;
-                        float wy = terrain.surfaceHeightAtWorld(wx, wz) - 0.3f / kMetersPerUnit;
+                        float wy = terrain.surfaceHeightAtWorld(wx, wz) - 0.35f / kMetersPerUnit;
                         float size = 1.5f + rand01() * rand01() * 7.0f;
                         kr.push_back({key, {wx, wy, wz, size, rand01() * 6.2831853f, 2}});
                     }
@@ -154,10 +301,9 @@ public:
         sortInto(kr, rocks, rockRanges);
     }
 
-    // Gather this frame's instances. Output is grouped: [conifer][broadleaf][boulder][billboard][grass].
     struct DrawGroups {
-        std::uint32_t conifer[kVariants][2], broadleaf[kVariants][2], coniferMid[2], broadleafMid[2];
-        std::uint32_t boulder[2], billboard[2], grass[2], fern[2], mossRock[2], flower[2];
+        std::uint32_t conifer[kVariants][2], broadleaf[kVariants][2], coniferMid[2], broadleafMid[2], dead[2];
+        std::uint32_t boulder[2], billboard[2], grass[2], fern[2], mossRock[2], flower[2], mushroom[2], litter[2];
     };
 
     DrawGroups gather(const Terrain& terrain, const glm::vec3& camPos, const glm::vec3& camFwd, VegInstanceGpu* out, std::uint32_t cap) const
@@ -165,11 +311,10 @@ public:
         DrawGroups g{};
         std::uint32_t count = 0;
         float subWorld = kSub * kTerrainWorldSize / static_cast<float>(kTerrainSize - 1);
-        auto push = [&](const Instance& in, float type, float scaleMul, float fade) {
+        auto push = [&](const Instance& in, float type, float scaleMul, float fade, float sub = 0.0f) {
             if (count >= cap) return;
-            out[count++] = {glm::vec4(in.x, in.y, in.z, in.scale * scaleMul), glm::vec4(in.rot, type, fade, static_cast<float>(in.type))};
+            out[count++] = {glm::vec4(in.x, in.y, in.z, in.scale * scaleMul), glm::vec4(in.rot, type, fade, sub)};
         };
-        // Passes: near full meshes per type/variant, mid LOD per type, boulders, billboards.
         auto forChunks = [&](float rMin, float rMax, auto&& fn) {
             for (int gz = 0; gz < gridN; ++gz) {
                 for (int gx = 0; gx < gridN; ++gx) {
@@ -185,6 +330,7 @@ public:
             float dx = in.x - camPos.x, dz = in.z - camPos.z;
             return std::sqrt(dx * dx + dz * dz);
         };
+        // Near full meshes per type and variant; dead snags in their own group.
         for (int type = 0; type < 2; ++type) {
             for (int v = 0; v < kVariants; ++v) {
                 std::uint32_t begin = count;
@@ -192,9 +338,11 @@ public:
                     const Range& r = treeRanges[key];
                     for (int i = 0; i < r.count; ++i) {
                         const Instance& in = trees[r.start + i];
-                        if (in.type != type || (r.start + i) % kVariants != v) continue;
+                        int slot = (r.start + i) % 5;                 // birch (variant 2) on one slot in five
+                        int variant = (slot == 4) ? 2 : (slot % 2);
+                        if (in.type != type || variant != v) continue;
                         if (treeDist(in) > kRNear) continue;
-                        push(in, static_cast<float>(type), 1.0f, 1.0f);
+                        push(in, static_cast<float>(type), 1.0f, 1.0f, static_cast<float>(v));
                     }
                 });
                 std::uint32_t* dst = (type == 0) ? g.conifer[v] : g.broadleaf[v];
@@ -208,11 +356,23 @@ public:
                     if (in.type != type) continue;
                     float d = treeDist(in);
                     if (d <= kRNear || d > kRMesh) continue;
-                    push(in, static_cast<float>(type), 1.0f, 1.0f);
+                    push(in, static_cast<float>(type), 1.0f, 1.0f, static_cast<float>((r.start + i) % kVariants));
                 }
             });
             std::uint32_t* dst = (type == 0) ? g.coniferMid : g.broadleafMid;
             dst[0] = begin; dst[1] = count - begin;
+        }
+        {
+            std::uint32_t begin = count;
+            forChunks(0.0f, kRMesh, [&](int key, float) {
+                const Range& r = treeRanges[key];
+                for (int i = 0; i < r.count; ++i) {
+                    const Instance& in = trees[r.start + i];
+                    if (in.type != 10 || treeDist(in) > kRMesh) continue;
+                    push(in, 10.0f, 1.0f, 1.0f);
+                }
+            });
+            g.dead[0] = begin; g.dead[1] = count - begin;
         }
         {
             std::uint32_t begin = count;
@@ -230,110 +390,102 @@ public:
                 for (int i = 0; i < r.count; i += thin) {
                     const Instance& in = trees[r.start + i];
                     if (treeDist(in) <= kRMesh) continue;
-                    push(in, 3.0f, 1.2f, 1.0f);
+                    push(in, 3.0f, 1.2f, 1.0f, in.type == 10 ? 1.0f : static_cast<float>(in.type));
                 }
             });
             g.billboard[0] = begin; g.billboard[1] = count - begin;
         }
-        // grass then ferns: hashed per cell around the camera, nothing stored
-        for (int fernPassI = 0; fernPassI < 3; ++fernPassI) {
-            bool fernPass = fernPassI == 1;
-            bool flowerPass = fernPassI == 2;
-            std::uint32_t begin = count;
-            const int N = kTerrainSize;
-            float cell = kTerrainWorldSize / static_cast<float>(N - 1);
-            float cellMeters = cell * kMetersPerUnit;
-            const float radius = 3.2f;   // ~190 m
-            int perCell = static_cast<int>(cellMeters * cellMeters / 1.6f);   // one tuft per 1.3x1.3 m
-            const std::vector<float>& H = terrain.heights();
-            const std::vector<float>& F = terrain.forestMap();
-            const std::vector<float>& W = terrain.waterMap();
-            const std::vector<float>& FL = terrain.flowMap();
-            float minH = 1e9f, maxH = -1e9f;
-            for (float h : H) { minH = std::min(minH, h); maxH = std::max(maxH, h); }
-            float span = std::max(maxH - minH, 0.001f);
+
+        // ---- undergrowth around the camera, hashed per cell, nothing stored -----------------
+        const int N = kTerrainSize;
+        float cell = kTerrainWorldSize / static_cast<float>(N - 1);
+        float cellMeters = cell * kMetersPerUnit;
+        const std::vector<float>& H = terrain.heights();
+        const std::vector<float>& F = terrain.forestMap();
+        const std::vector<float>& W = terrain.waterMap();
+        const std::vector<float>& FL = terrain.flowMap();
+        float minH = 1e9f, maxH = -1e9f;
+        for (float h : H) { minH = std::min(minH, h); maxH = std::max(maxH, h); }
+        float span = std::max(maxH - minH, 0.001f);
+        auto cellLoop = [&](float radius, auto&& fn) {
             int cx0 = static_cast<int>(std::floor(((camPos.x - radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
             int cx1 = static_cast<int>(std::ceil(((camPos.x + radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
             int cz0 = static_cast<int>(std::floor(((camPos.z - radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
             int cz1 = static_cast<int>(std::ceil(((camPos.z + radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
-            for (int cz = std::max(cz0, 0); cz <= std::min(cz1, N - 2); ++cz) {
+            for (int cz = std::max(cz0, 0); cz <= std::min(cz1, N - 2); ++cz)
                 for (int cx = std::max(cx0, 0); cx <= std::min(cx1, N - 2); ++cx) {
                     int ci = cz * N + cx;
-                    float slope = terrain.slopeAt(cx, cz);
-                    if (slope > 0.22f) continue;
                     if (!W.empty() && W[ci] > 0.08f) continue;
                     if (!FL.empty() && FL[ci] > 0.66f) continue;
-                    float hN = (H[ci] - minH) / span;
-                    if (hN > 0.72f) continue;
-                    float forestHere = F.empty() ? 0.0f : F[ci];
-                    // Meadow: grass. Forest floor: fewer grass tufts but ferns take over.
-                    float density = (1.0f - glm::clamp((slope - 0.12f) / 0.10f, 0.0f, 1.0f)) * (1.0f - 0.35f * forestHere);
-                    int n = static_cast<int>(perCell * density);
-                    std::uint32_t r = static_cast<std::uint32_t>(cx * 73856093) ^ static_cast<std::uint32_t>(cz * 19349663) ^ 0x9E3779B9u;
-                    for (int k = 0; k < n && count < cap; ++k) {
-                        r = r * 1664525u + 1013904223u; float fx = (r >> 8) / 16777216.0f;
-                        r = r * 1664525u + 1013904223u; float fz = (r >> 8) / 16777216.0f;
-                        r = r * 1664525u + 1013904223u; float fr = (r >> 8) / 16777216.0f;
-                        float wx = ((cx + fx) / (N - 1) - 0.5f) * kTerrainWorldSize;
-                        float wz = ((cz + fz) / (N - 1) - 0.5f) * kTerrainWorldSize;
-                        float ddx = wx - camPos.x, ddz = wz - camPos.z;
-                        float d2 = ddx * ddx + ddz * ddz;
-                        if (d2 > radius * radius) continue;
-                        if (ddx * camFwd.x + ddz * camFwd.z < -0.15f) continue;
-                        float fade = 1.0f - glm::clamp((std::sqrt(d2) - radius * 0.55f) / (radius * 0.45f), 0.0f, 1.0f);
-                        if (fade <= 0.02f) continue;
-                        float wy = terrain.surfaceHeightAtWorld(wx, wz) - 0.02f / kMetersPerUnit;
-                        // Every 7th tuft in forest becomes a fern (bigger, darker, drooping).
-                        bool fern = forestHere > 0.25f && (k % 6 == 0);
-                        bool flower = !fern && forestHere < 0.45f && (k % 9 == 4);
-                        if (flowerPass) { if (!flower) continue; }
-                        else { if (flower || fern != fernPass) continue; }
-                        float h = flower ? (0.45f + fr * 0.3f) : fern ? (0.9f + fr * 0.8f) : (0.55f + fr * 0.6f);
-                        float type = flower ? 7.0f : fern ? 5.0f : 4.0f;
-                        Instance in{wx, wy, wz, h * fade, fr * 6.2831853f, static_cast<std::uint8_t>(type)};
-                        push(in, type, 1.0f, fade);
-                    }
+                    fn(cx, cz, ci);
                 }
-            }
-            if (flowerPass) { g.flower[0] = begin; g.flower[1] = count - begin; }
-            else if (!fernPass) { g.grass[0] = begin; g.grass[1] = count - begin; }
-            else { g.fern[0] = begin; g.fern[1] = count - begin; }
+        };
+        // grass (pass 0), ferns (1), flowers (2), mushrooms (3), litter (4)
+        const float radius = 3.4f;   // ~200 m
+        for (int pass = 0; pass < 5; ++pass) {
+            std::uint32_t begin = count;
+            cellLoop(radius, [&](int cx, int cz, int ci) {
+                float slope = terrain.slopeAt(cx, cz);
+                if (slope > 0.26f) return;
+                float hN = (H[ci] - minH) / span;
+                if (hN > 0.72f) return;
+                float forestHere = F.empty() ? 0.0f : F[ci];
+                int perCell;
+                float density;
+                if (pass == 0) { perCell = static_cast<int>(cellMeters * cellMeters / 2.2f); density = (1.0f - glm::clamp((slope - 0.14f) / 0.10f, 0.0f, 1.0f)) * (1.0f - 0.45f * forestHere); }
+                else if (pass == 1) { perCell = static_cast<int>(cellMeters * cellMeters / 9.0f); density = glm::clamp((forestHere - 0.2f) / 0.5f, 0.0f, 1.0f); }
+                else if (pass == 2) { perCell = static_cast<int>(cellMeters * cellMeters / 14.0f); density = (1.0f - glm::clamp((forestHere - 0.1f) / 0.4f, 0.0f, 1.0f)) * (1.0f - glm::clamp((slope - 0.12f) / 0.1f, 0.0f, 1.0f)); }
+                else if (pass == 3) { perCell = static_cast<int>(cellMeters * cellMeters / 40.0f); density = glm::clamp((forestHere - 0.3f) / 0.5f, 0.0f, 1.0f); }
+                else { perCell = static_cast<int>(cellMeters * cellMeters / 5.0f); density = glm::clamp((forestHere - 0.15f) / 0.5f, 0.0f, 1.0f); }
+                int n = static_cast<int>(perCell * density);
+                std::uint32_t r = static_cast<std::uint32_t>(cx * 73856093) ^ static_cast<std::uint32_t>(cz * 19349663) ^ (0x9E3779B9u + pass * 0x632BE5ABu);
+                for (int k = 0; k < n && count < cap; ++k) {
+                    r = r * 1664525u + 1013904223u; float fx = (r >> 8) / 16777216.0f;
+                    r = r * 1664525u + 1013904223u; float fz = (r >> 8) / 16777216.0f;
+                    r = r * 1664525u + 1013904223u; float fr = (r >> 8) / 16777216.0f;
+                    float wx = ((cx + fx) / (N - 1) - 0.5f) * kTerrainWorldSize;
+                    float wz = ((cz + fz) / (N - 1) - 0.5f) * kTerrainWorldSize;
+                    float ddx = wx - camPos.x, ddz = wz - camPos.z;
+                    float d2 = ddx * ddx + ddz * ddz;
+                    if (d2 > radius * radius) continue;
+                    if (ddx * camFwd.x + ddz * camFwd.z < -0.2f) continue;
+                    float fade = 1.0f - glm::clamp((std::sqrt(d2) - radius * 0.6f) / (radius * 0.4f), 0.0f, 1.0f);
+                    if (fade <= 0.02f) continue;
+                    float wy = terrain.surfaceHeightAtWorld(wx, wz) - 0.02f / kMetersPerUnit;
+                    float sc, type;
+                    if (pass == 0) { sc = (0.7f + fr * 0.6f) * fade; type = 4.0f; }
+                    else if (pass == 1) { sc = (0.9f + fr * 0.7f) * fade; type = 5.0f; }
+                    else if (pass == 2) { sc = (0.45f + fr * 0.3f) * fade; type = 7.0f; }
+                    else if (pass == 3) { sc = 0.10f + fr * 0.14f; type = 8.0f; }
+                    else { sc = 0.9f + fr * 0.8f; type = 9.0f; }
+                    Instance in{wx, wy, wz, sc, fr * 6.2831853f, static_cast<std::uint8_t>(type)};
+                    push(in, type, 1.0f, fade, forestHere);
+                }
+            });
+            std::uint32_t* dst = (pass == 0) ? g.grass : (pass == 1) ? g.fern : (pass == 2) ? g.flower : (pass == 3) ? g.mushroom : g.litter;
+            dst[0] = begin; dst[1] = count - begin;
         }
-        // Small mossy rocks scattered on the forest floor and meadows near the camera.
+        // Small mossy rocks on the forest floor and meadows near the camera.
         {
             std::uint32_t begin = count;
-            const int N = kTerrainSize;
-            const float radius = 2.6f;
-            const std::vector<float>& F = terrain.forestMap();
-            const std::vector<float>& W = terrain.waterMap();
-            int cx0 = static_cast<int>(std::floor(((camPos.x - radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
-            int cx1 = static_cast<int>(std::ceil(((camPos.x + radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
-            int cz0 = static_cast<int>(std::floor(((camPos.z - radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
-            int cz1 = static_cast<int>(std::ceil(((camPos.z + radius) / kTerrainWorldSize + 0.5f) * (N - 1)));
-            for (int cz = std::max(cz0, 0); cz <= std::min(cz1, N - 2); ++cz) {
-                for (int cx = std::max(cx0, 0); cx <= std::min(cx1, N - 2); ++cx) {
-                    int ci = cz * N + cx;
-                    float slope = terrain.slopeAt(cx, cz);
-                    if (slope > 0.30f) continue;
-                    if (!W.empty() && W[ci] > 0.08f) continue;
-                    float forestHere = F.empty() ? 0.0f : F[ci];
-                    std::uint32_t r = static_cast<std::uint32_t>(cx * 2654435761u) ^ static_cast<std::uint32_t>(cz * 40503u) ^ 0x51ED27u;
-                    r = r * 1664525u + 1013904223u;
-                    int n = ((r >> 8) % 100) < static_cast<unsigned>(25 + 45 * forestHere) ? 1 : 0;
-                    for (int k = 0; k < n && count < cap; ++k) {
-                        r = r * 1664525u + 1013904223u; float fx = (r >> 8) / 16777216.0f;
-                        r = r * 1664525u + 1013904223u; float fz = (r >> 8) / 16777216.0f;
-                        r = r * 1664525u + 1013904223u; float fr = (r >> 8) / 16777216.0f;
-                        float wx = ((cx + fx) / (N - 1) - 0.5f) * kTerrainWorldSize;
-                        float wz = ((cz + fz) / (N - 1) - 0.5f) * kTerrainWorldSize;
-                        float ddx = wx - camPos.x, ddz = wz - camPos.z;
-                        if (ddx * ddx + ddz * ddz > radius * radius) continue;
-                        float wy = terrain.surfaceHeightAtWorld(wx, wz) - 0.25f / kMetersPerUnit;
-                        Instance in{wx, wy, wz, 0.6f + fr * fr * 2.2f, fr * 6.2831853f, 6};
-                        push(in, 6.0f, 1.0f, forestHere);
-                    }
+            cellLoop(2.8f, [&](int cx, int cz, int ci) {
+                float slope = terrain.slopeAt(cx, cz);
+                if (slope > 0.30f) return;
+                float forestHere = F.empty() ? 0.0f : F[ci];
+                std::uint32_t r = static_cast<std::uint32_t>(cx * 2654435761u) ^ static_cast<std::uint32_t>(cz * 40503u) ^ 0x51ED27u;
+                r = r * 1664525u + 1013904223u;
+                int n = ((r >> 8) % 100) < static_cast<unsigned>(28 + 45 * forestHere) ? 1 : 0;
+                for (int k = 0; k < n && count < cap; ++k) {
+                    r = r * 1664525u + 1013904223u; float fx = (r >> 8) / 16777216.0f;
+                    r = r * 1664525u + 1013904223u; float fz = (r >> 8) / 16777216.0f;
+                    r = r * 1664525u + 1013904223u; float fr = (r >> 8) / 16777216.0f;
+                    float wx = ((cx + fx) / (N - 1) - 0.5f) * kTerrainWorldSize;
+                    float wz = ((cz + fz) / (N - 1) - 0.5f) * kTerrainWorldSize;
+                    float wy = terrain.surfaceHeightAtWorld(wx, wz) - 0.25f / kMetersPerUnit;
+                    Instance in{wx, wy, wz, 0.6f + fr * fr * 2.4f, fr * 6.2831853f, 6};
+                    push(in, 6.0f, 1.0f, forestHere);
                 }
-            }
+            });
             g.mossRock[0] = begin; g.mossRock[1] = count - begin;
         }
         return g;
@@ -342,49 +494,30 @@ public:
 private:
     std::uint32_t rng_ = 12345u;
     float rand01() { rng_ = rng_ * 1664525u + 1013904223u; return (rng_ >> 8) / 16777216.0f; }
+    static constexpr float kS = 1.0f / kMetersPerUnit;   // metres -> world units
 
-    // ---- mesh builder: unit objects, 1 m = 1/kMetersPerUnit world units ------------------
-    int addVertex(const glm::vec3& p, const glm::vec3& n, const glm::vec3& c)
+    int addVertex(const glm::vec3& p, const glm::vec3& n, const glm::vec3& c, glm::vec2 uv = {0, 0}, float layer = -1.0f)
     {
-        vertices.push_back({p, n, c});
+        vertices.push_back({p, n, c, glm::vec4(uv, layer, 0.0f)});
         return static_cast<int>(vertices.size()) - 1;
     }
     void tri(int a, int b, int c) { indices.push_back(a); indices.push_back(b); indices.push_back(c); }
     glm::vec3 shade(const glm::vec3& c, float lo, float hi) { return c * (lo + rand01() * (hi - lo)); }
 
-    void cone(glm::vec3 base, float radius, float height, int segs, glm::vec3 col, float jitter)
+    // Textured card: centre c, right axis r (half width), up axis u (half height), both in metres.
+    void card(glm::vec3 c, glm::vec3 r, glm::vec3 u, int layer, glm::vec3 tint, bool bottomAnchored = false)
     {
-        const float s = 1.0f / kMetersPerUnit;
-        int apex = addVertex(base + glm::vec3(0, height * s, 0), {0, 1, 0}, col);
-        int first = static_cast<int>(vertices.size());
-        for (int i = 0; i < segs; ++i) {
-            float a = i / static_cast<float>(segs) * 6.2831853f;
-            float r = radius * (1.0f + (rand01() - 0.5f) * jitter);
-            glm::vec3 p = base + glm::vec3(std::cos(a) * r * s, (rand01() - 0.5f) * jitter * height * 0.15f * s, std::sin(a) * r * s);
-            glm::vec3 n = glm::normalize(glm::vec3(std::cos(a) * height, radius, std::sin(a) * height));
-            addVertex(p, n, shade(col, 0.85f, 1.15f));
-        }
-        for (int i = 0; i < segs; ++i) tri(apex, first + (i + 1) % segs, first + i);
+        glm::vec3 n = glm::normalize(glm::cross(r, u));
+        glm::vec3 base = bottomAnchored ? c : c - u;
+        int i0 = addVertex((base - r) * kS, n, tint, {0, 1}, static_cast<float>(layer));
+        int i1 = addVertex((base + r) * kS, n, tint, {1, 1}, static_cast<float>(layer));
+        int i2 = addVertex((base + r + u * 2.0f) * kS, n, tint, {1, 0}, static_cast<float>(layer));
+        int i3 = addVertex((base - r + u * 2.0f) * kS, n, tint, {0, 0}, static_cast<float>(layer));
+        tri(i0, i1, i2); tri(i0, i2, i3);
     }
-    void cylinder(glm::vec3 base, float r0, float r1, float height, int segs, glm::vec3 col)
-    {
-        const float s = 1.0f / kMetersPerUnit;
-        int first = static_cast<int>(vertices.size());
-        for (int i = 0; i < segs; ++i) {
-            float a = i / static_cast<float>(segs) * 6.2831853f;
-            glm::vec3 n{std::cos(a), 0, std::sin(a)};
-            addVertex(base + glm::vec3(n.x * r0 * s, 0, n.z * r0 * s), n, col);
-            addVertex(base + glm::vec3(n.x * r1 * s, height * s, n.z * r1 * s), n, col);
-        }
-        for (int i = 0; i < segs; ++i) {
-            int a0 = first + i * 2, a1 = a0 + 1;
-            int b0 = first + ((i + 1) % segs) * 2, b1 = b0 + 1;
-            tri(a0, b0, a1); tri(a1, b0, b1);
-        }
-    }
+
     void blob(glm::vec3 center, float radius, float squashY, int rings, int segs, glm::vec3 col, float jitter)
     {
-        const float s = 1.0f / kMetersPerUnit;
         int first = static_cast<int>(vertices.size());
         for (int r = 0; r <= rings; ++r) {
             float phi = r / static_cast<float>(rings) * 3.14159265f;
@@ -392,33 +525,21 @@ private:
                 float th = q / static_cast<float>(segs) * 6.2831853f;
                 glm::vec3 d{std::sin(phi) * std::cos(th), std::cos(phi), std::sin(phi) * std::sin(th)};
                 float jr = (q == segs || r == 0 || r == rings) ? 1.0f : 1.0f + (rand01() - 0.5f) * jitter;
-                glm::vec3 p = center + glm::vec3(d.x * radius * jr * s, d.y * radius * squashY * jr * s, d.z * radius * jr * s);
-                addVertex(p, d, shade(col, 0.8f, 1.2f));
+                glm::vec3 p = center + glm::vec3(d.x * radius * jr, d.y * radius * squashY * jr, d.z * radius * jr);
+                addVertex(p * kS, d, shade(col, 0.8f, 1.2f));
             }
         }
-        for (int r = 0; r < rings; ++r) {
-            for (int q = 0; q < segs; ++q) {
-                int a = first + r * (segs + 1) + q;
-                int b = a + segs + 1;
-                tri(a, a + 1, b); tri(a + 1, b + 1, b);
-            }
+        for (int r = 0; r < rings; ++r) for (int q = 0; q < segs; ++q) {
+            int a = first + r * (segs + 1) + q;
+            int b = a + segs + 1;
+            tri(a, a + 1, b); tri(a + 1, b + 1, b);
         }
     }
-    VegMeshRange finishRange(std::uint32_t firstIndex)
-    {
-        VegMeshRange r;
-        r.firstIndex = firstIndex;
-        r.indexCount = static_cast<std::uint32_t>(indices.size()) - firstIndex;
-        r.vertexOffset = 0;
-        return r;
-    }
 
-
-    // Tapered, gently curving branch made of ring segments. Returns the end point and direction.
+    // Tapered, gently curving branch of ring segments (metres). Returns end point and direction.
     void branchTube(glm::vec3 base, glm::vec3 dir, float len, float r0, float r1, int segs, int sides,
                     float wobble, float upBias, const glm::vec3& col, glm::vec3& endP, glm::vec3& endD)
     {
-        const float s = 1.0f / kMetersPerUnit;
         glm::vec3 p = base;
         glm::vec3 d = glm::normalize(dir);
         int prevRing = -1;
@@ -431,14 +552,12 @@ private:
             for (int i = 0; i < sides; ++i) {
                 float a = i / static_cast<float>(sides) * 6.2831853f;
                 glm::vec3 n = axisA * std::cos(a) + axisB * std::sin(a);
-                addVertex((p + n * r) * s, n, col * (0.94f + rand01() * 0.12f));
+                addVertex((p + n * r) * kS, n, col * (0.94f + rand01() * 0.12f));
             }
-            if (prevRing >= 0) {
-                for (int i = 0; i < sides; ++i) {
-                    int a0 = prevRing + i, a1 = prevRing + (i + 1) % sides;
-                    int b0 = ring + i, b1 = ring + (i + 1) % sides;
-                    tri(a0, b0, a1); tri(a1, b0, b1);
-                }
+            if (prevRing >= 0) for (int i = 0; i < sides; ++i) {
+                int a0 = prevRing + i, a1 = prevRing + (i + 1) % sides;
+                int b0 = ring + i, b1 = ring + (i + 1) % sides;
+                tri(a0, b0, a1); tri(a1, b0, b1);
             }
             prevRing = ring;
             if (seg < segs) {
@@ -450,250 +569,223 @@ private:
         endP = p; endD = d;
     }
 
-    void leafCluster(glm::vec3 c, float radius, int count, float leafSize, const glm::vec3& col)
+    // Leaf cards around a point: each card is a textured cluster ~cardSize metres across.
+    void leafCards(glm::vec3 c, float radius, int count, float cardSize, int layer, glm::vec3 tint)
     {
-        const float s = 1.0f / kMetersPerUnit;
         for (int k = 0; k < count; ++k) {
-            glm::vec3 o{rand01() - 0.5f, (rand01() - 0.5f) * 0.6f, rand01() - 0.5f};
+            glm::vec3 o{rand01() - 0.5f, (rand01() - 0.5f) * 0.7f, rand01() - 0.5f};
             glm::vec3 p = c + o * (2.0f * radius);
-            float a = rand01() * 6.2831853f, tilt = (rand01() - 0.5f) * 1.2f;
-            glm::vec3 u{std::cos(a), tilt, std::sin(a)};
-            u = glm::normalize(u);
-            glm::vec3 w = glm::normalize(glm::cross(u, glm::vec3(0.3f, 1.0f, 0.2f)));
-            glm::vec3 n = glm::normalize(glm::cross(u, w));
-            if (n.y < 0.0f) n = -n;
-            float L = leafSize * (0.8f + rand01() * 0.5f), W = L * 0.55f;
-            glm::vec3 shade = col * (0.75f + rand01() * 0.5f);
-            int i0 = addVertex(p * s, n, shade);
-            int i1 = addVertex((p + u * (L * 0.5f) + w * (W * 0.5f)) * s, n, shade);
-            int i2 = addVertex((p + u * L) * s, n, shade * 1.1f);
-            int i3 = addVertex((p + u * (L * 0.5f) - w * (W * 0.5f)) * s, n, shade);
-            tri(i0, i1, i2); tri(i0, i2, i3);
+            float a = rand01() * 6.2831853f, tilt = (rand01() - 0.5f) * 1.6f;
+            glm::vec3 r = glm::normalize(glm::vec3(std::cos(a), 0.0f, std::sin(a))) * (cardSize * 0.5f);
+            glm::vec3 u = glm::normalize(glm::vec3(-std::sin(a) * std::sin(tilt), std::cos(tilt), std::cos(a) * std::sin(tilt))) * (cardSize * 0.5f);
+            card(p, r, u, layer, tint * (0.85f + rand01() * 0.3f));
         }
     }
 
-    // Broadleaf: curved trunk, 2 levels of branches, leaf lozenges at the branch tips.
-    void buildBroadleafTree(bool midLod)
+    // Broadleaf: a unit-height tree (1 m tall in the mesh; instance scale = height in metres).
+    // Cards are sized in real metres assuming a ~20 m tree, so leaves stay leaf-sized.
+    void buildBroadleafTree(bool midLod, bool birch)
     {
-        glm::vec3 bark{0.22f, 0.17f, 0.12f};
-        glm::vec3 leaf{0.18f, 0.34f, 0.13f};
+        const float H = 20.0f;   // reference height used to size cards
+        glm::vec3 bark = birch ? glm::vec3(0.80f, 0.78f, 0.72f) : glm::vec3(0.24f, 0.19f, 0.14f);
+        glm::vec3 leafTint = birch ? glm::vec3(1.05f, 1.05f, 0.95f) : glm::vec3(1.0f);
+        int layer = birch ? FOL_BIRCH : FOL_LEAF;
         glm::vec3 endP, endD;
-        branchTube({0, 0, 0}, {0.02f * (rand01() - 0.5f), 1, 0.02f * (rand01() - 0.5f)}, 0.40f, 0.030f, 0.020f,
-                   midLod ? 3 : 5, midLod ? 5 : 7, 0.025f, 0.01f, bark, endP, endD);
+        float trunkH = birch ? 0.55f : 0.45f;
+        branchTube({0, 0, 0}, {0.02f * (rand01() - 0.5f), 1, 0.02f * (rand01() - 0.5f)}, trunkH, birch ? 0.016f : 0.024f, birch ? 0.009f : 0.014f,
+                   midLod ? 3 : 6, midLod ? 5 : 8, 0.03f, 0.01f, bark, endP, endD);
+        float cardM = (birch ? 1.6f : 2.2f) / H;   // card size in unit-tree metres
         if (midLod) {
-            leafCluster({0, 0.74f, 0}, 0.30f, 34, 0.24f, leaf);
+            leafCards({0, 0.76f, 0}, 0.26f, birch ? 14 : 18, cardM * 2.2f, layer, leafTint);
             return;
         }
-        int nMain = 4 + static_cast<int>(rand01() * 2.0f);
+        int nMain = 4 + static_cast<int>(rand01() * 3.0f);
         for (int b = 0; b < nMain; ++b) {
             float a = b / static_cast<float>(nMain) * 6.2831853f + rand01() * 0.6f;
-            float spread = 0.55f + rand01() * 0.3f;
-            glm::vec3 d = glm::normalize(glm::vec3(std::cos(a) * spread, 1.0f + rand01() * 0.4f, std::sin(a) * spread));
+            float spread = 0.5f + rand01() * 0.35f;
+            glm::vec3 d = glm::normalize(glm::vec3(std::cos(a) * spread, 1.0f + rand01() * 0.5f, std::sin(a) * spread));
             glm::vec3 p2, d2;
-            branchTube(endP, d, 0.26f + rand01() * 0.12f, 0.016f, 0.008f, 3, 5, 0.10f, 0.02f, bark, p2, d2);
-            leafCluster(glm::mix(endP, p2, 0.7f), 0.10f, 8, 0.11f, leaf);
-            int nSub = 3 + static_cast<int>(rand01() * 2.0f);
+            float len = 0.24f + rand01() * 0.14f;
+            branchTube(endP, d, len, birch ? 0.008f : 0.012f, 0.005f, 3, 5, 0.12f, 0.02f, bark, p2, d2);
+            int nSub = 3 + static_cast<int>(rand01() * 3.0f);
             for (int c = 0; c < nSub; ++c) {
                 float ca = rand01() * 6.2831853f;
-                glm::vec3 sd = glm::normalize(d2 * 0.6f + glm::vec3(std::cos(ca), 0.25f + rand01() * 0.5f, std::sin(ca)) * 0.7f);
+                glm::vec3 sd = glm::normalize(d2 * 0.6f + glm::vec3(std::cos(ca), 0.2f + rand01() * 0.5f, std::sin(ca)) * 0.7f);
                 glm::vec3 p3, d3;
-                branchTube(p2, sd, 0.12f + rand01() * 0.10f, 0.007f, 0.003f, 2, 4, 0.15f, 0.0f, bark, p3, d3);
-                leafCluster(p3, 0.12f, 14, 0.11f, leaf);
-                leafCluster(glm::mix(p2, p3, 0.5f), 0.08f, 7, 0.10f, leaf);
+                branchTube(p2, sd, 0.10f + rand01() * 0.10f, 0.004f, 0.0015f, 2, 4, 0.15f, 0.0f, bark, p3, d3);
+                leafCards(p3, 0.09f, 7, cardM, layer, leafTint);
+                leafCards(glm::mix(p2, p3, 0.5f), 0.06f, 3, cardM, layer, leafTint);
             }
-            leafCluster(p2, 0.11f, 10, 0.11f, leaf);
+            leafCards(p2, 0.09f, 5, cardM, layer, leafTint);
         }
     }
 
-    // Conifer: straight tapered trunk with whorls of drooping branch fans, needle lozenges dark.
+    // Conifer: straight trunk, whorls of branch tubes each carrying a needle-spray card.
     void buildConiferTree(bool midLod)
     {
-        const float s = 1.0f / kMetersPerUnit;
-        glm::vec3 bark{0.20f, 0.14f, 0.10f};
-        glm::vec3 needle{0.09f, 0.18f, 0.09f};
+        const float H = 26.0f;
+        glm::vec3 bark{0.22f, 0.15f, 0.10f};
         glm::vec3 endP, endD;
-        branchTube({0, 0, 0}, {0, 1, 0}, 0.96f, 0.024f, 0.004f, midLod ? 3 : 6, midLod ? 5 : 6, 0.01f, 0.0f, bark, endP, endD);
-        int whorls = midLod ? 6 : 11;
+        branchTube({0, 0, 0}, {0, 1, 0}, 0.96f, 0.020f, 0.003f, midLod ? 3 : 6, midLod ? 5 : 6, 0.01f, 0.0f, bark, endP, endD);
+        int whorls = midLod ? 7 : 12;
+        float sprayM = 3.2f / H;
         for (int w = 0; w < whorls; ++w) {
-            float t = (w + 1) / static_cast<float>(whorls + 1);
-            float y = 0.20f + t * 0.76f;
-            float reach = (1.0f - t) * 0.30f + 0.04f;
-            int nb = midLod ? 5 : 6 + (w % 2);
+            float t = (w + 0.5f) / static_cast<float>(whorls);
+            float y = 0.18f + t * 0.78f;
+            float reach = (1.0f - t) * 0.26f + 0.03f;
+            int nb = midLod ? 4 : 6;
             for (int b = 0; b < nb; ++b) {
-                float a = b / static_cast<float>(nb) * 6.2831853f + w * 0.6f + rand01() * 0.3f;
-                glm::vec3 d{std::cos(a), -0.28f + rand01() * 0.15f, std::sin(a)};
-                d = glm::normalize(d);
-                glm::vec3 side = glm::normalize(glm::cross(d, glm::vec3(0, 1, 0)));
+                float a = b / static_cast<float>(nb) * 6.2831853f + w * 0.7f + rand01() * 0.4f;
+                glm::vec3 d = glm::normalize(glm::vec3(std::cos(a), -0.25f + rand01() * 0.12f, std::sin(a)));
                 glm::vec3 base{0, y, 0};
-                glm::vec3 tip = base + d * reach;
-                // branch fan: a flat lozenge with a slight droop, plus a couple of side tufts
-                glm::vec3 n = glm::normalize(glm::cross(side, d));
-                if (n.y < 0.0f) n = -n;
-                glm::vec3 shade = needle * (0.8f + rand01() * 0.4f);
-                float hw = reach * 0.22f;
-                int i0 = addVertex(base * s, n, shade * 0.8f);
-                int i1 = addVertex((base + d * (reach * 0.5f) + side * hw - glm::vec3(0, 0.02f, 0)) * s, n, shade);
-                int i2 = addVertex(tip * s, n, shade * 1.15f);
-                int i3 = addVertex((base + d * (reach * 0.5f) - side * hw - glm::vec3(0, 0.02f, 0)) * s, n, shade);
-                tri(i0, i1, i2); tri(i0, i2, i3);
                 if (!midLod) {
-                    for (int k = 0; k < 2; ++k) {
-                        glm::vec3 c = base + d * (reach * (0.35f + 0.35f * k));
-                        glm::vec3 sd = glm::normalize(d * 0.5f + side * (k == 0 ? 1.0f : -1.0f) * 0.8f + glm::vec3(0, -0.2f, 0));
-                        glm::vec3 tp = c + sd * (reach * 0.35f);
-                        int j0 = addVertex(c * s, n, shade * 0.9f);
-                        int j1 = addVertex((c + sd * (reach * 0.17f) + d * (hw * 0.5f)) * s, n, shade);
-                        int j2 = addVertex(tp * s, n, shade * 1.1f);
-                        int j3 = addVertex((c + sd * (reach * 0.17f) - d * (hw * 0.5f)) * s, n, shade);
-                        tri(j0, j1, j2); tri(j0, j2, j3);
-                    }
+                    glm::vec3 pe, de;
+                    branchTube(base, d, reach * 0.55f, 0.006f, 0.002f, 1, 4, 0.0f, 0.0f, bark, pe, de);
                 }
+                // spray card lying along the branch, slightly drooping, plus a crossed one
+                glm::vec3 mid = base + d * (reach * 0.55f);
+                glm::vec3 up = glm::normalize(glm::cross(glm::cross(d, glm::vec3(0, 1, 0)), d));
+                float half = reach * 0.5f;
+                glm::vec3 side = glm::normalize(glm::cross(d, up));
+                float sw = std::min(half * 0.9f, sprayM * 0.6f);
+                // card(): r = half width axis, u = half height axis, texture "up" = along the branch
+                card(mid, side * sw, d * half, FOL_NEEDLE, glm::vec3(1.0f));
+                if (!midLod) card(mid, up * sw * 0.8f, d * half, FOL_NEEDLE, glm::vec3(0.95f));
             }
         }
         // crown spike
-        glm::vec3 shade = needle;
-        int c0 = addVertex(glm::vec3(0, 0.90f, 0) * s, {0, 1, 0}, shade);
-        int c1 = addVertex(glm::vec3(0.05f, 0.92f, 0) * s, {0, 1, 0}, shade);
-        int c2 = addVertex(glm::vec3(0, 1.0f, 0) * s, {0, 1, 0}, shade * 1.1f);
-        int c3 = addVertex(glm::vec3(-0.05f, 0.92f, 0) * s, {0, 1, 0}, shade);
-        tri(c0, c1, c2); tri(c0, c2, c3);
+        card({0, 0.955f, 0}, glm::vec3(0.035f, 0, 0), glm::vec3(0, 0.045f, 0), FOL_NEEDLE, glm::vec3(1.0f));
+        card({0, 0.955f, 0}, glm::vec3(0, 0, 0.035f), glm::vec3(0, 0.045f, 0), FOL_NEEDLE, glm::vec3(1.0f));
+    }
+
+    // Dead snag: grey trunk, a few bare broken limbs, no foliage.
+    void buildDeadTree()
+    {
+        glm::vec3 bark{0.42f, 0.40f, 0.36f};
+        glm::vec3 endP, endD;
+        branchTube({0, 0, 0}, {0.04f * (rand01() - 0.5f), 1, 0.04f * (rand01() - 0.5f)}, 0.7f, 0.026f, 0.010f, 5, 7, 0.05f, 0.0f, bark, endP, endD);
+        int n = 3 + static_cast<int>(rand01() * 3.0f);
+        for (int b = 0; b < n; ++b) {
+            float y = 0.35f + rand01() * 0.4f;
+            float a = rand01() * 6.2831853f;
+            glm::vec3 d = glm::normalize(glm::vec3(std::cos(a), 0.1f + rand01() * 0.6f, std::sin(a)));
+            glm::vec3 pe, de;
+            branchTube({0, y, 0}, d, 0.10f + rand01() * 0.18f, 0.010f, 0.002f, 2, 4, 0.2f, -0.05f, bark, pe, de);
+        }
+        // broken top
+        card({0, 0.72f, 0}, glm::vec3(0.02f, 0, 0), glm::vec3(0, 0.03f, 0), -1, bark * 0.7f);
+    }
+
+    VegMeshRange finishRange(std::uint32_t firstIndex)
+    {
+        VegMeshRange r;
+        r.firstIndex = firstIndex;
+        r.indexCount = static_cast<std::uint32_t>(indices.size()) - firstIndex;
+        return r;
     }
 
     void buildMeshes()
     {
-        const float s = 1.0f / kMetersPerUnit;
-        rng_ = 777u;
-        // Unit trees are 1 m tall; the instance scale is the tree height in metres.
         std::uint32_t f0 = 0;
         for (int v = 0; v < kVariants; ++v) {
             rng_ = 900u + v * 7919u;
-            std::uint32_t f = static_cast<std::uint32_t>(indices.size());
-            buildBroadleafTree(false);
-            broadleaf[v] = finishRange(f);
+            f0 = static_cast<std::uint32_t>(indices.size());
+            buildBroadleafTree(false, v == 2);   // third variant is birch
+            broadleaf[v] = finishRange(f0);
             rng_ = 1300u + v * 104729u;
-            f = static_cast<std::uint32_t>(indices.size());
+            f0 = static_cast<std::uint32_t>(indices.size());
             buildConiferTree(false);
-            conifer[v] = finishRange(f);
+            conifer[v] = finishRange(f0);
         }
         rng_ = 4242u;
-        f0 = static_cast<std::uint32_t>(indices.size());
-        buildBroadleafTree(true);
-        broadleafMid = finishRange(f0);
-        f0 = static_cast<std::uint32_t>(indices.size());
-        buildConiferTree(true);
-        coniferMid = finishRange(f0);
+        f0 = static_cast<std::uint32_t>(indices.size()); buildBroadleafTree(true, false); broadleafMid = finishRange(f0);
+        f0 = static_cast<std::uint32_t>(indices.size()); buildConiferTree(true); coniferMid = finishRange(f0);
+        rng_ = 5150u;
+        f0 = static_cast<std::uint32_t>(indices.size()); buildDeadTree(); deadTree = finishRange(f0);
 
+        // Boulder (textured in the shader).
+        rng_ = 777u;
         f0 = static_cast<std::uint32_t>(indices.size());
-        blob({0, 0.30f * s, 0}, 0.5f, 0.7f, 4, 7, {0.30f, 0.29f, 0.27f}, 0.45f);
+        blob({0, 0.30f, 0}, 0.5f, 0.7f, 4, 7, {0.30f, 0.29f, 0.27f}, 0.45f);
         boulder = finishRange(f0);
 
+        // Billboard: two crossed cards with the leaf texture for far trees; coloured per subtype in the shader.
         f0 = static_cast<std::uint32_t>(indices.size());
-        for (int k = 0; k < 2; ++k) {
-            float a = k * 3.14159265f * 0.5f;
-            glm::vec3 d{std::cos(a), 0, std::sin(a)};
-            glm::vec3 n{-std::sin(a), 0, std::cos(a)};
-            glm::vec3 col{1.0f, 1.0f, 1.0f};   // coloured per subtype in the vertex shader
-            int i0 = addVertex({-d.x * 0.22f * s, 0, -d.z * 0.22f * s}, n, col);
-            int i1 = addVertex({d.x * 0.22f * s, 0, d.z * 0.22f * s}, n, col);
-            int i2 = addVertex({0, 1.0f * s, 0}, n, col);
-            tri(i0, i1, i2);
-        }
+        card({0, 0.5f, 0}, glm::vec3(0.30f, 0, 0), glm::vec3(0, 0.5f, 0), FOL_LEAF, glm::vec3(1.0f));
+        card({0, 0.5f, 0}, glm::vec3(0, 0, 0.30f), glm::vec3(0, 0.5f, 0), FOL_LEAF, glm::vec3(1.0f));
         billboard = finishRange(f0);
 
+        // Grass: three crossed cards, unit height 1 m.
         f0 = static_cast<std::uint32_t>(indices.size());
-        for (int k = 0; k < 26; ++k) {
-            float a = k / 26.0f * 6.2831853f + rand01() * 0.5f;
-            float lean = 0.25f + rand01() * 0.55f;
-            float hgt = 0.55f + rand01() * 0.65f;
-            float w = 0.012f + rand01() * 0.014f;
-            glm::vec3 d{std::cos(a), 0, std::sin(a)};
-            glm::vec3 side{-std::sin(a) * w, 0, std::cos(a) * w};
-            glm::vec3 root{d.x * 0.10f * rand01(), 0, d.z * 0.10f * rand01()};
-            glm::vec3 base{0.07f, 0.15f, 0.05f}, tip{0.15f, 0.29f, 0.09f};
-            glm::vec3 n{d.x, 0.6f, d.z};
-            // two segments so the blade curves over
-            glm::vec3 mid{(root.x + d.x * lean * 0.35f), hgt * 0.55f, (root.z + d.z * lean * 0.35f)};
-            glm::vec3 top{(root.x + d.x * lean), hgt, (root.z + d.z * lean)};
-            int i0 = addVertex((root - side) * s, n, base);
-            int i1 = addVertex((root + side) * s, n, base);
-            int i2 = addVertex((mid - side * 0.6f) * s, n, glm::mix(base, tip, 0.5f));
-            int i3 = addVertex((mid + side * 0.6f) * s, n, glm::mix(base, tip, 0.5f));
-            int i4 = addVertex(top * s, n, tip);
-            tri(i0, i1, i3); tri(i0, i3, i2); tri(i2, i3, i4);
+        for (int k = 0; k < 3; ++k) {
+            float a = k / 3.0f * 3.14159265f + rand01() * 0.3f;
+            glm::vec3 r{std::cos(a) * 0.55f, 0, std::sin(a) * 0.55f};
+            card({0, 0, 0}, r, glm::vec3(0, 0.5f, 0), FOL_GRASS, glm::vec3(1.0f), true);
         }
         grass = finishRange(f0);
 
-        // Fern: pinnate fronds. A thin stem strip carries pairs of leaflets that shrink toward the tip.
+        // Fern: rosette of frond cards leaning outward.
         f0 = static_cast<std::uint32_t>(indices.size());
-        for (int k = 0; k < 9; ++k) {
-            float a = k / 9.0f * 6.2831853f + rand01() * 0.6f;
+        for (int k = 0; k < 7; ++k) {
+            float a = k / 7.0f * 6.2831853f + rand01() * 0.4f;
             glm::vec3 d{std::cos(a), 0, std::sin(a)};
             glm::vec3 side{-std::sin(a), 0, std::cos(a)};
-            glm::vec3 stemCol{0.16f, 0.26f, 0.10f};
-            glm::vec3 leafCol{0.13f, 0.30f, 0.11f};
-            const int segs = 9;
-            int prevL = -1, prevR = -1;
-            for (int seg = 0; seg <= segs; ++seg) {
-                float t = seg / static_cast<float>(segs);
-                float out = t * 0.95f;
-                float up = 0.12f + 0.95f * std::sin(t * 2.2f) - t * t * 0.5f;
-                glm::vec3 c = glm::vec3(d.x * out, up, d.z * out);
-                glm::vec3 n = glm::normalize(glm::vec3(d.x * 0.3f, 1.0f, d.z * 0.3f));
-                float sw = 0.012f * (1.0f - t * 0.7f);
-                int L = addVertex((c - side * sw) * s, n, stemCol);
-                int R = addVertex((c + side * sw) * s, n, stemCol);
-                if (prevL >= 0) { tri(prevL, prevR, L); tri(prevR, R, L); }
-                prevL = L; prevR = R;
-                if (seg > 0 && seg < segs) {
-                    float len = (0.10f + 0.16f * std::sin(t * 3.14159f));
-                    float lw = 0.035f;
-                    for (int sideSign = -1; sideSign <= 1; sideSign += 2) {
-                        glm::vec3 lo = side * (float)sideSign;
-                        glm::vec3 tipP = c + lo * len + d * 0.03f + glm::vec3(0, -0.02f, 0);
-                        glm::vec3 shade = leafCol * (0.85f + 0.3f * t);
-                        int b0 = addVertex((c + d * lw) * s, n, shade);
-                        int b1 = addVertex((c - d * lw) * s, n, shade);
-                        int b2 = addVertex(tipP * s, n, shade * 1.1f);
-                        int bm = addVertex((c + lo * len * 0.5f + d * lw * 1.6f) * s, n, shade);
-                        int bn = addVertex((c + lo * len * 0.5f - d * lw * 1.6f) * s, n, shade);
-                        tri(b0, bm, b2); tri(b0, b2, b1); tri(b1, b2, bn);
-                    }
-                }
-            }
+            float lean = 0.85f + rand01() * 0.4f;        // radians from vertical
+            glm::vec3 up = glm::normalize(glm::vec3(0, std::cos(lean), 0) + d * std::sin(lean));
+            float len = 0.9f + rand01() * 0.4f;
+            card(glm::vec3(0, 0.05f, 0), side * (len * 0.28f), up * (len * 0.5f), FOL_FERN, glm::vec3(0.95f + rand01() * 0.1f), true);
         }
         fern = finishRange(f0);
+
+        // Moss rock (textured in shader).
+        f0 = static_cast<std::uint32_t>(indices.size());
+        blob({0, 0.35f, 0}, 0.5f, 0.75f, 4, 7, {0.34f, 0.36f, 0.30f}, 0.5f);
+        mossRock = finishRange(f0);
 
         // Flower: thin stems with a five-petal white head, three per instance.
         f0 = static_cast<std::uint32_t>(indices.size());
         for (int k = 0; k < 3; ++k) {
-            float a = rand01() * 6.2831853f;
-            float r = rand01() * 0.12f;
+            float a = rand01() * 6.2831853f, r = rand01() * 0.14f;
             glm::vec3 base{std::cos(a) * r, 0, std::sin(a) * r};
             float h = 0.7f + rand01() * 0.3f;
-            glm::vec3 stemCol{0.18f, 0.30f, 0.10f};
-            glm::vec3 n{0, 1, 0};
-            int s0 = addVertex((base + glm::vec3(-0.008f, 0, 0)) * s, n, stemCol);
-            int s1 = addVertex((base + glm::vec3(0.008f, 0, 0)) * s, n, stemCol);
-            int s2 = addVertex((base + glm::vec3(0, h, 0)) * s, n, stemCol);
+            glm::vec3 stemCol{0.18f, 0.30f, 0.10f}, n{0, 1, 0};
+            int s0 = addVertex((base + glm::vec3(-0.006f, 0, 0)) * kS, n, stemCol);
+            int s1 = addVertex((base + glm::vec3(0.006f, 0, 0)) * kS, n, stemCol);
+            int s2 = addVertex((base + glm::vec3(0, h, 0)) * kS, n, stemCol);
             tri(s0, s1, s2);
             glm::vec3 head = base + glm::vec3(0, h, 0);
             for (int pth = 0; pth < 5; ++pth) {
                 float pa = pth / 5.0f * 6.2831853f;
-                glm::vec3 pd{std::cos(pa), 0, std::sin(pa)};
-                glm::vec3 ps{-std::sin(pa), 0, std::cos(pa)};
+                glm::vec3 pd{std::cos(pa), 0, std::sin(pa)}, ps{-std::sin(pa), 0, std::cos(pa)};
                 glm::vec3 white{0.92f, 0.92f, 0.85f};
-                int c0 = addVertex(head * s, n, {0.85f, 0.75f, 0.30f});
-                int c1 = addVertex((head + pd * 0.05f + ps * 0.025f) * s, n, white);
-                int c2 = addVertex((head + pd * 0.09f) * s, n, white);
-                int c3 = addVertex((head + pd * 0.05f - ps * 0.025f) * s, n, white);
+                int c0 = addVertex(head * kS, n, {0.85f, 0.75f, 0.30f});
+                int c1 = addVertex((head + pd * 0.05f + ps * 0.025f) * kS, n, white);
+                int c2 = addVertex((head + pd * 0.09f) * kS, n, white);
+                int c3 = addVertex((head + pd * 0.05f - ps * 0.025f) * kS, n, white);
                 tri(c0, c1, c2); tri(c0, c2, c3);
             }
         }
         flower = finishRange(f0);
 
-        // Moss rock: small lumpy boulder, greenish grey; instance fade carries forest cover for a mossier tint.
+        // Mushroom: pale stem, domed cap. Unit height 1 m (instances are 10-25 cm).
         f0 = static_cast<std::uint32_t>(indices.size());
-        blob({0, 0.35f * s, 0}, 0.5f, 0.75f, 4, 7, {0.34f, 0.36f, 0.30f}, 0.5f);
-        mossRock = finishRange(f0);
+        {
+            glm::vec3 endP, endD;
+            branchTube({0, 0, 0}, {0, 1, 0}, 0.62f, 0.10f, 0.08f, 1, 6, 0.0f, 0.0f, {0.80f, 0.74f, 0.62f}, endP, endD);
+            blob({0, 0.66f, 0}, 0.36f, 0.55f, 3, 8, {0.50f, 0.26f, 0.12f}, 0.15f);
+        }
+        mushroom = finishRange(f0);
+
+        // Litter: one flat card on the ground with fallen leaves.
+        f0 = static_cast<std::uint32_t>(indices.size());
+        {
+            glm::vec3 n{0, 1, 0};
+            int i0 = addVertex(glm::vec3(-0.5f, 0.01f, -0.5f) * kS, n, glm::vec3(1.0f), {0, 1}, FOL_LITTER);
+            int i1 = addVertex(glm::vec3(0.5f, 0.01f, -0.5f) * kS, n, glm::vec3(1.0f), {1, 1}, FOL_LITTER);
+            int i2 = addVertex(glm::vec3(0.5f, 0.01f, 0.5f) * kS, n, glm::vec3(1.0f), {1, 0}, FOL_LITTER);
+            int i3 = addVertex(glm::vec3(-0.5f, 0.01f, 0.5f) * kS, n, glm::vec3(1.0f), {0, 0}, FOL_LITTER);
+            tri(i0, i1, i2); tri(i0, i2, i3);
+        }
+        litter = finishRange(f0);
     }
 };
