@@ -723,7 +723,7 @@ private:
         for (int k = 0; k < 3; ++k) {
             float a = k / 3.0f * 3.14159265f + rand01() * 0.3f;
             glm::vec3 r{std::cos(a) * 0.55f, 0, std::sin(a) * 0.55f};
-            card({0, 0, 0}, r, glm::vec3(0, 0.5f, 0), FOL_GRASS, glm::vec3(1.0f), true);
+            card({0, -0.22f, 0}, r, glm::vec3(0, 0.61f, 0), FOL_GRASS, glm::vec3(1.0f), true);
         }
         grass = finishRange(f0);
 
@@ -736,7 +736,7 @@ private:
             float lean = 0.85f + rand01() * 0.4f;        // radians from vertical
             glm::vec3 up = glm::normalize(glm::vec3(0, std::cos(lean), 0) + d * std::sin(lean));
             float len = 0.9f + rand01() * 0.4f;
-            card(glm::vec3(0, 0.05f, 0), side * (len * 0.28f), up * (len * 0.5f), FOL_FERN, glm::vec3(0.95f + rand01() * 0.1f), true);
+            card(glm::vec3(0, -0.12f, 0), side * (len * 0.28f), up * (len * 0.56f), FOL_FERN, glm::vec3(0.95f + rand01() * 0.1f), true);
         }
         fern = finishRange(f0);
 
