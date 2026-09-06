@@ -24,7 +24,8 @@ layout(set = 0, binding = 0) uniform SceneUniforms {
     vec4 lightning;    // xyz flash world pos, w intensity
     vec4 shadowParams; // x sun-shadows on, y cloud-shadow strength
     vec4 material;     // x macro tile, y mid tile, z near tile (world units), w terrain grid res
-    vec4 quality;      // x textures, y terrain shadow, z cloud shadow
+    vec4 quality;      // x textures, y terrain shadow, z cloud shadow, w time
+    mat4 lightViewProj;
 } u;
 
 // Shared with the cloud pass: cloud water volume + terrain height, for shadow marches.
@@ -35,6 +36,7 @@ layout(set = 0, binding = 4) uniform sampler2DArray matAlbedo;
 layout(set = 0, binding = 5) uniform sampler2DArray matNormal;
 // Ecology map: r flow accumulation, g curvature (0.5 flat), b forest density, a sky view.
 layout(set = 0, binding = 6) uniform sampler2D ecoTex;
+layout(set = 0, binding = 8) uniform sampler2DShadow shadowTex;
 
 layout(location = 0) out vec4 outColor;
 
@@ -243,6 +245,23 @@ vec3 tintLayer(int layer, vec3 c, vec2 p, float height01, float drainage, float 
     return c;
 }
 
+
+// Sun shadow map: soft 3x3 lookup, fading out at the edge of the box around the camera.
+float shadowMapVis(vec3 wp, vec3 n)
+{
+    if (u.shadowParams.x < 0.5) return 1.0;
+    vec4 lp = u.lightViewProj * vec4(wp + n * 0.012, 1.0);
+    vec3 c = lp.xyz / lp.w;
+    vec2 uv = c.xy * 0.5 + 0.5;
+    if (uv.x <= 0.0 || uv.x >= 1.0 || uv.y <= 0.0 || uv.y >= 1.0 || c.z >= 1.0) return 1.0;
+    float edge = smoothstep(0.0, 0.08, min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)));
+    float sum = 0.0;
+    const float texel = 1.0 / 4096.0;
+    for (int j = -1; j <= 1; ++j) for (int i = -1; i <= 1; ++i)
+        sum += texture(shadowTex, vec3(uv + vec2(float(i), float(j)) * texel * 1.5, c.z - 0.0006));
+    return mix(1.0, sum / 9.0, edge);
+}
+
 vec3 aces(vec3 x)
 {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
@@ -301,7 +320,7 @@ void main()
     // forest from the ecology map; marsh where water collects on flat ground; snow from
     // the surface state, shed from steep faces and held in gullies.
     float rock = smoothstep(0.30, 0.48, slope + convex * 0.08 + (fine - 0.5) * 0.10);
-    float scree = (1.0 - rock) * smoothstep(0.14, 0.28, slope) * smoothstep(0.28, 0.55, height01 + (broad - 0.5) * 0.12);
+    float scree = (1.0 - rock) * smoothstep(0.20, 0.34, slope) * smoothstep(0.30, 0.58, height01 + (broad - 0.5) * 0.12);
     scree = max(scree, (1.0 - rock) * smoothstep(0.50, 0.72, height01 + (medium - 0.5) * 0.10) * 0.75);
     float forest = smoothstep(0.10, 0.55, forestDensity) * (1.0 - rock);
     float marsh = smoothstep(0.42, 0.80, flow) * (1.0 - smoothstep(0.02, 0.07, slope)) * (1.0 - forest * 0.6);
@@ -393,7 +412,7 @@ void main()
     float shade = mix(0.58, 1.0, smoothstep(-0.12, 0.36, dot(n, lightDir)));
 
     // Cast shadows: terrain self-shadowing + cloud shadows attenuate direct sun only.
-    float sunVis = sunTerrainShadow(vWorldPos, lightDir) * cloudShadow(vWorldPos, lightDir);
+    float sunVis = sunTerrainShadow(vWorldPos, lightDir) * cloudShadow(vWorldPos, lightDir) * shadowMapVis(vWorldPos, gN);
     // Forest canopy blocks most direct sun and part of the sky on the floor beneath it.
     float canopyBlock = smoothstep(0.08, 0.45, forestDensity);
     // Dappled light: sun reaches the floor in shifting patches between the crowns.

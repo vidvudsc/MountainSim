@@ -28,15 +28,34 @@ layout(set = 0, binding = 0) uniform SceneUniforms {
     vec4 shadowParams;
     vec4 material;
     vec4 quality;
+    mat4 lightViewProj;
 } u;
 layout(set = 0, binding = 4) uniform sampler2DArray matAlbedo;
 layout(set = 0, binding = 6) uniform sampler2D ecoTex;
 layout(set = 0, binding = 7) uniform sampler2DArray foliageTex;
+layout(set = 0, binding = 8) uniform sampler2DShadow shadowTex;
 
 layout(location = 0) out vec4 outColor;
 const float WS = 165.0;
 
 vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+
+// Sun shadow map: soft 3x3 lookup, fading out at the edge of the box around the camera.
+float shadowMapVis(vec3 wp, vec3 n)
+{
+    if (u.shadowParams.x < 0.5) return 1.0;
+    vec4 lp = u.lightViewProj * vec4(wp + n * 0.012, 1.0);
+    vec3 c = lp.xyz / lp.w;
+    vec2 uv = c.xy * 0.5 + 0.5;
+    if (uv.x <= 0.0 || uv.x >= 1.0 || uv.y <= 0.0 || uv.y >= 1.0 || c.z >= 1.0) return 1.0;
+    float edge = smoothstep(0.0, 0.08, min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)));
+    float sum = 0.0;
+    const float texel = 1.0 / 4096.0;
+    for (int j = -1; j <= 1; ++j) for (int i = -1; i <= 1; ++i)
+        sum += texture(shadowTex, vec3(uv + vec2(float(i), float(j)) * texel * 1.5, c.z - 0.0006));
+    return mix(1.0, sum / 9.0, edge);
+}
+
 float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
 
 void main()
@@ -94,11 +113,12 @@ void main()
     vec3 ambient = mix(vec3(0.020, 0.028, 0.048), vec3(0.15, 0.18, 0.22), daylight) * (0.6 + 0.4 * clamp(n.y, 0.0, 1.0));
     float NoL = clamp(dot(n, L) * 0.7 + 0.3, 0.0, 1.0);
     float ao = mix(vType > 3.5 ? 0.55 : 0.45, 1.0, vHeight01);
-    vec3 color = albedo * (ambient * 0.95 + u.sunColor.xyz * NoL * vShadow * 0.52) * ao;
+    float sunVis = vShadow * shadowMapVis(vWorldPos, n);
+    vec3 color = albedo * (ambient * 0.95 + u.sunColor.xyz * NoL * sunVis * 0.52) * ao;
     // Thin foliage lets light through: backlit leaves and blades glow.
     if (textured && vType < 9.5) {
         float through = pow(clamp(dot(V, L), 0.0, 1.0), 3.0);
-        color += albedo * vec3(1.0, 1.0, 0.7) * u.sunColor.xyz * through * vShadow * (leaf ? 0.32 : 0.10);
+        color += albedo * vec3(1.0, 1.0, 0.7) * u.sunColor.xyz * through * sunVis * (leaf ? 0.32 : 0.10);
     }
 
 

@@ -55,6 +55,9 @@ set(VULKAN_SHADERS
   ${SHADER_SOURCE_DIR}/terrain.frag
   ${SHADER_SOURCE_DIR}/veg.vert
   ${SHADER_SOURCE_DIR}/veg.frag
+  ${SHADER_SOURCE_DIR}/shadow_terrain.vert
+  ${SHADER_SOURCE_DIR}/shadow_veg.vert
+  ${SHADER_SOURCE_DIR}/shadow_veg.frag
 )
 
 set(SPIRV_SHADERS)

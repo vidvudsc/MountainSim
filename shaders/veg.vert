@@ -25,6 +25,7 @@ layout(set = 0, binding = 0) uniform SceneUniforms {
     vec4 shadowParams;
     vec4 material;
     vec4 quality;   // w = time
+    mat4 lightViewProj;
 } u;
 layout(set = 0, binding = 3) uniform sampler2D heightTex;
 
@@ -71,6 +72,22 @@ void main()
     float s = inPosScale.w;
     float c = cos(inRotType.x), sn = sin(inRotType.x);
     vec3 p = inPosition * s;
+    float t0 = inRotType.y;
+    bool treeLike = (t0 < 1.5) || (t0 > 9.5 && t0 < 10.5);
+    if (treeLike) {
+        // Individual trees: girth varies independently of height, and each leans a little,
+        // bending progressively from a planted base.
+        float h1 = hash2(inPosScale.xz + 3.1);
+        float h2 = hash2(inPosScale.zx * 1.7 + 9.3);
+        float girth = 0.72 + 0.7 * h1;
+        p.xz *= girth;
+        float h01 = clamp(inPosition.y * 60.0, 0.0, 1.0);
+        float lean = (h2 - 0.5) * 0.22 * h01;          // up to ~6 degrees at the crown
+        float la = h1 * 6.2831853;
+        vec3 axis = vec3(cos(la), 0.0, sin(la));
+        float cl = cos(lean), sl = sin(lean);
+        p = p * cl + cross(axis, p) * sl + axis * dot(axis, p) * (1.0 - cl);
+    }
     vec3 rp = vec3(c * p.x + sn * p.z, p.y, -sn * p.x + c * p.z);
     vec3 world = inPosScale.xyz + rp;
     // Wind: a slow gust field over the map plus a faster flutter, bending with height.

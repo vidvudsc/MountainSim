@@ -124,12 +124,13 @@ public:
             glm::vec3 col{0.27f + rnd() * 0.08f, 0.40f + rnd() * 0.10f, 0.15f + rnd() * 0.05f};
             leaf(FOL_BIRCH, S * 0.5f + std::cos(a) * r, S * 0.5f + std::sin(a) * r, S * (0.035f + rnd() * 0.02f), S * (0.028f + rnd() * 0.012f), rnd() * 6.28f, col, false);
         }
-        // FOL_GRASS: many blades rooted along the bottom edge.
-        for (int i = 0; i < 95; ++i) {
-            float x0 = S * (0.08f + rnd() * 0.84f);
-            float h = S * (0.30f + rnd() * 0.52f);   // keep the card top clear so tufts do not read as boxes
-            glm::vec3 base{0.09f, 0.17f, 0.06f}, tip{0.22f + rnd() * 0.08f, 0.34f + rnd() * 0.08f, 0.13f};
-            blade(FOL_GRASS, x0, S - 1.0f, h, S * 0.018f, (rnd() - 0.5f) * 1.6f, base, tip);
+        // FOL_GRASS: thin curved blades, sparse enough that the card base never reads as a slab.
+        for (int i = 0; i < 46; ++i) {
+            float x0 = S * (0.10f + rnd() * 0.80f);
+            float h = S * (0.30f + rnd() * 0.52f);
+            float k = rnd();
+            glm::vec3 base{0.10f + 0.04f * k, 0.18f + 0.05f * k, 0.06f}, tip{0.26f + rnd() * 0.10f, 0.38f + rnd() * 0.10f, 0.14f + rnd() * 0.05f};
+            blade(FOL_GRASS, x0, S - 1.0f, h, S * 0.008f, (rnd() - 0.5f) * 2.4f, base, tip);
         }
         // FOL_FERN: a frond, stem up the middle with paired leaflets shrinking to the tip; each
         // leaflet made of small serrated sub-leaflets.
@@ -432,7 +433,7 @@ public:
                 float forestHere = F.empty() ? 0.0f : F[ci];
                 int perCell;
                 float density;
-                if (pass == 0) { perCell = static_cast<int>(cellMeters * cellMeters / 1.3f); density = (1.0f - glm::clamp((slope - 0.14f) / 0.10f, 0.0f, 1.0f)) * (1.0f - 0.25f * forestHere); }
+                if (pass == 0) { perCell = static_cast<int>(cellMeters * cellMeters / 0.9f); density = (1.0f - glm::clamp((slope - 0.14f) / 0.10f, 0.0f, 1.0f)) * (1.0f - 0.25f * forestHere); }
                 else if (pass == 1) { perCell = static_cast<int>(cellMeters * cellMeters / 9.0f); density = glm::clamp((forestHere - 0.2f) / 0.5f, 0.0f, 1.0f); }
                 else if (pass == 2) { perCell = static_cast<int>(cellMeters * cellMeters / 14.0f); density = (1.0f - glm::clamp((forestHere - 0.1f) / 0.4f, 0.0f, 1.0f)) * (1.0f - glm::clamp((slope - 0.12f) / 0.1f, 0.0f, 1.0f)); }
                 else if (pass == 3) { perCell = static_cast<int>(cellMeters * cellMeters / 40.0f); density = glm::clamp((forestHere - 0.3f) / 0.5f, 0.0f, 1.0f); }
@@ -720,10 +721,11 @@ private:
 
         // Grass: three crossed cards, unit height 1 m.
         f0 = static_cast<std::uint32_t>(indices.size());
-        for (int k = 0; k < 3; ++k) {
-            float a = k / 3.0f * 3.14159265f + rand01() * 0.3f;
-            glm::vec3 r{std::cos(a) * 0.55f, 0, std::sin(a) * 0.55f};
-            card({0, -0.22f, 0}, r, glm::vec3(0, 0.61f, 0), FOL_GRASS, glm::vec3(1.0f), true);
+        for (int k = 0; k < 4; ++k) {
+            float a = k / 4.0f * 3.14159265f + rand01() * 0.3f;
+            glm::vec3 r{std::cos(a) * 0.42f, 0, std::sin(a) * 0.42f};
+            glm::vec3 up = glm::normalize(glm::vec3((rand01() - 0.5f) * 0.25f, 1.0f, (rand01() - 0.5f) * 0.25f)) * 0.62f;
+            card({(rand01() - 0.5f) * 0.15f, -0.22f, (rand01() - 0.5f) * 0.15f}, r, up, FOL_GRASS, glm::vec3(0.9f + rand01() * 0.2f), true);
         }
         grass = finishRange(f0);
 
