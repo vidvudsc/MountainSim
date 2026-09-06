@@ -163,7 +163,7 @@ public:
                         for (int i = 0; i < r.count; ++i) push(rocks[r.start + i], 2.0f, 1.0f, 1.0f);
                     } else {
                         if (dist <= kRMesh) continue;
-                        int thin = (dist > 110.0f) ? 4 : (dist > 55.0f) ? 2 : 1;
+                        int thin = (dist > 110.0f) ? 6 : (dist > 55.0f) ? 3 : (dist > 35.0f) ? 2 : 1;
                         const Range& r = treeRanges[key];
                         for (int i = 0; i < r.count; i += thin) push(trees[r.start + i], 3.0f, 1.2f, 1.0f);
                     }

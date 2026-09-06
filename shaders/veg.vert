@@ -76,6 +76,19 @@ void main()
     }
     vHeight01 = clamp(inPosition.y * 60.0, 0.0, 1.0);   // unit object is 1 m tall (1/kMetersPerUnit units)
     vType = inRotType.y;
-    vShadow = sunTerrainShadow(inPosScale.xyz + vec3(0.0, 0.05, 0.0), normalize(u.sunDir.xyz));
+    // Far billboards: cheap 4-step march; meshes get the full one.
+    vec3 sd = normalize(u.sunDir.xyz);
+    if (inRotType.y > 2.5 && inRotType.y < 3.5) {
+        float res = 1.0;
+        float t = 2.0;
+        for (int i = 0; i < 4; ++i) {
+            vec3 pp = inPosScale.xyz + vec3(0.0, 0.3, 0.0) + sd * t;
+            res = min(res, 6.0 * (pp.y - terrainH(pp.xz) + 0.9) / t);
+            t *= 2.2;
+        }
+        vShadow = (u.shadowParams.x < 0.5 || sd.y <= 0.03) ? 1.0 : mix(1.0, clamp(res, 0.0, 1.0), smoothstep(0.03, 0.14, sd.y));
+    } else {
+        vShadow = sunTerrainShadow(inPosScale.xyz + vec3(0.0, 0.05, 0.0), sd);
+    }
     gl_Position = u.proj * u.view * vec4(world, 1.0);
 }

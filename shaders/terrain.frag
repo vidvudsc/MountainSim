@@ -212,6 +212,34 @@ float cloudShadow(vec3 wp, vec3 sd)
     return mix(1.0, max(trans, 0.22), strength * smoothstep(0.05, 0.18, sd.y));
 }
 
+// Per-layer colour grading, shared by whichever two layers won the blend.
+vec3 tintLayer(int layer, vec3 c, vec2 p, float height01, float drainage, float medium, float convex, float wet)
+{
+    if (layer == 0) {          // rock: grey with a cool cast, strata bands keep a little warmth
+        float strata = fbm3(vec2(p.x * 0.08, height01 * 24.0));
+        float rl = dot(c, vec3(0.3, 0.59, 0.11));
+        c = mix(vec3(rl), c, 0.35) * vec3(0.86, 0.88, 0.92);
+        c *= mix(0.80, 1.16, strata);
+        c = mix(c, c * vec3(1.06, 1.0, 0.94), strata * 0.3);
+    } else if (layer == 1) {   // scree
+        float sl = dot(c, vec3(0.3, 0.59, 0.11));
+        c = mix(vec3(sl), c, 0.30) * vec3(0.80, 0.83, 0.86) * mix(1.0, 0.88, smoothstep(0.5, 0.8, height01));
+    } else if (layer == 2) {   // meadow: straw where dry, green in hollows
+        float dry = smoothstep(0.35, 0.75, medium * 0.6 + convex * 0.3 + height01 * 0.4 - wet * 0.5);
+        vec3 tint = mix(vec3(0.86, 0.98, 0.70), vec3(0.92, 0.86, 0.60), dry);
+        float gl = dot(c, vec3(0.3, 0.59, 0.11));
+        c = mix(vec3(gl), c, 0.78) * tint;
+    } else if (layer == 3) {   // forest floor under canopy
+        float canopy = fbm3(p * 0.45);
+        c *= vec3(0.22, 0.36, 0.17) * (0.70 + 0.6 * canopy) * (1.0 - drainage * 0.25);
+    } else if (layer == 4) {   // snow
+        c *= 1.05;
+    } else {                   // marsh
+        c *= vec3(0.95, 0.98, 0.85);
+    }
+    return c;
+}
+
 vec3 aces(vec3 x)
 {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
@@ -278,46 +306,31 @@ void main()
     snow = max(snow, snowMass * concave * 0.5);
     snow = clamp(snow + smoothstep(0.88, 0.98, height01) * (1.0 - smoothstep(0.55, 0.75, slope)) * 0.6, 0.0, 1.0);
 
-    // Compose textured materials as layered "over" operations.
+    // Layered "over" stack converted to weights, then only the two heaviest materials are
+    // sampled: the texture taps were the biggest cost in the frame.
+    float wSnow = snow;
+    float wRock = rock * (1.0 - snow);
+    float wScree = scree * (1.0 - rock) * (1.0 - snow);
+    float wForest = forest * (1.0 - scree) * (1.0 - rock) * (1.0 - snow);
+    float wMarsh = marsh * (1.0 - forest) * (1.0 - scree) * (1.0 - rock) * (1.0 - snow);
+    float wGrass = max(0.0, 1.0 - wSnow - wRock - wScree - wForest - wMarsh);
+    float wts[6] = float[6](wRock, wScree, wGrass, wForest, wSnow, wMarsh);   // layer order
+    int a = 0; float wa = -1.0;
+    for (int i = 0; i < 6; ++i) if (wts[i] > wa) { wa = wts[i]; a = i; }
+    int b = -1; float wb = 0.0;
+    for (int i = 0; i < 6; ++i) if (i != a && wts[i] > wb) { wb = wts[i]; b = i; }
+    if (wb < 0.06) { b = -1; wb = 0.0; }
+    float fb = wb / max(wa + wb, 0.0001);
+
     vec2 tn;
     vec2 tnAcc;
-    vec3 base = material(2.0, vWorldPos, gN, ntVar, tnAcc);
-    {
-        float dry = smoothstep(0.35, 0.75, medium * 0.6 + convex * 0.3 + height01 * 0.4 - wet * 0.5);
-        vec3 tint = mix(vec3(0.86, 0.98, 0.70), vec3(0.92, 0.86, 0.60), dry);
-        float gl = dot(base, vec3(0.3, 0.59, 0.11));
-        base = mix(vec3(gl), base, 0.78) * tint;
-    }
-    if (marsh > 0.03) {
-        vec3 c = material(5.0, vWorldPos, gN, ntVar, tn) * vec3(0.95, 0.98, 0.85);
-        base = mix(base, c, marsh); tnAcc = mix(tnAcc, tn, marsh);
-    }
-    if (forest > 0.03) {
-        vec3 c = material(3.0, vWorldPos, gN, ntVar, tn);
-        float canopy = fbm3(p * 0.45);
-        c *= vec3(0.22, 0.36, 0.17) * (0.70 + 0.6 * canopy) * (1.0 - drainage * 0.25);
-        base = mix(base, c, forest); tnAcc = mix(tnAcc, tn + (canopy - 0.5) * 0.4, forest);
-    }
-    if (scree > 0.03) {
-        vec3 c = material(1.0, vWorldPos, gN, ntVar, tn);
-        float sl = dot(c, vec3(0.3, 0.59, 0.11));
-        // Scree reads grey: pull the tan photo toward luminance and cool it.
-        c = mix(vec3(sl), c, 0.30) * vec3(0.80, 0.83, 0.86) * mix(1.0, 0.88, smoothstep(0.5, 0.8, height01));
-        base = mix(base, c, scree); tnAcc = mix(tnAcc, tn, scree);
-    }
-    if (rock > 0.03) {
-        vec3 c = material(0.0, vWorldPos, gN, ntVar, tn);
-        float strata = fbm3(vec2(vWorldPos.x * 0.08, vWorldPos.y * 0.55));
-        float rl = dot(c, vec3(0.3, 0.59, 0.11));
-        // Bare rock is grey with a cool cast; only the strata bands keep a little warmth.
-        c = mix(vec3(rl), c, 0.35) * vec3(0.86, 0.88, 0.92);
-        c *= mix(0.80, 1.16, strata);
-        c = mix(c, c * vec3(1.06, 1.0, 0.94), strata * 0.3);
-        base = mix(base, c, rock); tnAcc = mix(tnAcc, tn, rock);
-    }
-    if (snow > 0.03) {
-        vec3 c = material(4.0, vWorldPos, gN, ntVar, tn) * 1.05;
-        base = mix(base, c, snow); tnAcc = mix(tnAcc, tn * 0.5, snow);
+    vec3 base = material(float(a), vWorldPos, gN, ntVar, tnAcc);
+    base = tintLayer(a, base, p, height01, drainage, medium, convex, wet);
+    if (b >= 0) {
+        vec3 cb = material(float(b), vWorldPos, gN, ntVar, tn);
+        cb = tintLayer(b, cb, p, height01, drainage, medium, convex, wet);
+        base = mix(base, cb, fb);
+        tnAcc = mix(tnAcc, tn, fb);
     }
     base = mix(base, vec3(0.70, 0.86, 0.96), iceMask * 0.72);
     // Cavity shading and wet ground.

@@ -489,8 +489,13 @@ private:
         return formats.front();
     }
 
-    VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>&)
+    VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& modes)
     {
+        // MS_UNCAPPED=1: render as fast as possible so frame times can be measured.
+        if (std::getenv("MS_UNCAPPED")) {
+            for (VkPresentModeKHR m : modes) if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) return m;
+            for (VkPresentModeKHR m : modes) if (m == VK_PRESENT_MODE_MAILBOX_KHR) return m;
+        }
         // Always vsync. FIFO is the only mode the spec guarantees, and preferring
         // MAILBOX (as before) would render uncapped wherever it exists — pure heat on
         // a laptop with no visible benefit for an orbit-camera scene.
