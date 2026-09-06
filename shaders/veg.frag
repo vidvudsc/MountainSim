@@ -52,7 +52,8 @@ void main()
     vec3 albedo = vColor;
     if (textured) {
         vec4 t = texture(foliageTex, vUvLayer);
-        if (t.a < 0.35) discard;
+        float a = clamp((t.a - 0.32) / max(fwidth(t.a), 0.0001) + 0.5, 0.0, 1.0);
+        if (a < 0.5) discard;
         albedo = vColor * t.rgb;
     }
     bool leaf = textured && (vType < 1.5 || (vType > 2.5 && vType < 3.5));   // tree foliage cards
@@ -72,16 +73,16 @@ void main()
         vec3 moss = texture(matAlbedo, vec3(pw.xz * 1.7, 2.0)).rgb * vec3(0.45, 0.85, 0.35);
         albedo = mix(rock, moss, smoothstep(0.35, 0.75, mossAmt + (mossNoise - 0.5) * 0.35));
     } else if ((vType < 1.5 || vType > 9.5) && !textured) {
-        float ang = atan(vWorldPos.z * 40.0, vWorldPos.x * 40.0);
+        // Bark: the rock photo wrapped around the trunk (angle, height), tinted.
+        float ang = atan(n.z, n.x);
+        vec2 buv = vec2(ang / 6.2831853 * 3.0, vWorldPos.y * 9.0);
+        vec3 rock = texture(matAlbedo, vec3(buv, 0.0)).rgb;
+        float rl = dot(rock, vec3(0.3, 0.59, 0.11));
         if (birch) {
-            // Birch: pale bark with short dark horizontal marks.
-            float mark = hash(vec2(floor(vWorldPos.y * 300.0), floor(ang * 2.5 + vWorldPos.y * 9.0)));
-            float band = hash(vec2(floor(vWorldPos.y * 120.0), 3.0));
-            albedo *= (mark > 0.90) ? 0.30 : (band > 0.93 ? 0.55 : (0.92 + 0.16 * hash(vec2(floor(vWorldPos.y * 40.0), 1.0))));
+            float fleck = hash(vec2(floor(vWorldPos.y * 320.0), floor(ang * 4.0 + vWorldPos.y * 9.0)));
+            albedo *= (fleck > 0.93) ? 0.28 : (0.85 + 0.35 * rl);
         } else {
-            // Bark: vertical fissures from a cheap stripe hash.
-            float stripe = hash(vec2(floor(ang * 5.0), floor(vWorldPos.y * 120.0 + hash(vec2(floor(ang * 5.0))) * 7.0)));
-            albedo *= 0.65 + 0.7 * stripe;
+            albedo *= (0.55 + 0.9 * rl);
         }
     }
     float hv = (vType > 2.5 && vType < 3.5) ? 0.5 : hash(floor(vWorldPos.xz * 37.0));
@@ -93,11 +94,11 @@ void main()
     vec3 ambient = mix(vec3(0.020, 0.028, 0.048), vec3(0.15, 0.18, 0.22), daylight) * (0.6 + 0.4 * clamp(n.y, 0.0, 1.0));
     float NoL = clamp(dot(n, L) * 0.7 + 0.3, 0.0, 1.0);
     float ao = mix(vType > 3.5 ? 0.55 : 0.45, 1.0, vHeight01);
-    vec3 color = albedo * (ambient * 0.85 + u.sunColor.xyz * NoL * vShadow * 0.62) * ao;
+    vec3 color = albedo * (ambient * 0.95 + u.sunColor.xyz * NoL * vShadow * 0.52) * ao;
     // Thin foliage lets light through: backlit leaves and blades glow.
     if (textured && vType < 9.5) {
         float through = pow(clamp(dot(V, L), 0.0, 1.0), 3.0);
-        color += albedo * vec3(1.0, 1.0, 0.7) * u.sunColor.xyz * through * vShadow * (leaf ? 0.5 : 0.12);
+        color += albedo * vec3(1.0, 1.0, 0.7) * u.sunColor.xyz * through * vShadow * (leaf ? 0.32 : 0.10);
     }
 
 

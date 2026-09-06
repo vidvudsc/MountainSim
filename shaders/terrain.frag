@@ -229,9 +229,12 @@ vec3 tintLayer(int layer, vec3 c, vec2 p, float height01, float drainage, float 
         vec3 tint = mix(vec3(0.86, 0.98, 0.70), vec3(0.92, 0.86, 0.60), dry);
         float gl = dot(c, vec3(0.3, 0.59, 0.11));
         c = mix(vec3(gl), c, 0.78) * tint;
-    } else if (layer == 3) {   // forest floor: leaf litter and dark soil under canopy
+    } else if (layer == 3) {   // forest floor: mossy dark green with bare soil patches and paths
         float canopy = fbm3(p * 0.45);
-        c *= vec3(0.52, 0.42, 0.28) * (0.65 + 0.6 * canopy) * (1.0 - drainage * 0.25);
+        float bare = smoothstep(0.55, 0.75, fbm3(p * 0.9 + vec2(7.0, 3.0)));
+        vec3 mossy = vec3(0.30, 0.40, 0.20);
+        vec3 soil = vec3(0.46, 0.36, 0.24);
+        c *= mix(mossy, soil, bare) * (0.70 + 0.5 * canopy) * (1.0 - drainage * 0.2);
     } else if (layer == 4) {   // snow
         c *= 1.05;
     } else {                   // marsh
@@ -394,7 +397,7 @@ void main()
     // Forest canopy blocks most direct sun and part of the sky on the floor beneath it.
     float canopyBlock = smoothstep(0.08, 0.45, forestDensity);
     // Dappled light: sun reaches the floor in shifting patches between the crowns.
-    float dapple = smoothstep(0.42, 0.72, fbm(p * 2.6 + vec2(u.quality.w * 0.02, 0.0)));
+    float dapple = smoothstep(0.42, 0.72, fbm3(p * 2.6 + vec2(u.quality.w * 0.02, 0.0)));
     sunVis *= mix(1.0, 0.18 + 0.82 * dapple, canopyBlock * 0.9);
     svf *= 1.0 - canopyBlock * 0.45;
 
