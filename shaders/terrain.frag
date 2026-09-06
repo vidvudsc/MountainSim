@@ -24,6 +24,7 @@ layout(set = 0, binding = 0) uniform SceneUniforms {
     vec4 lightning;    // xyz flash world pos, w intensity
     vec4 shadowParams; // x sun-shadows on, y cloud-shadow strength
     vec4 material;     // x macro tile, y mid tile, z near tile (world units), w terrain grid res
+    vec4 quality;      // x textures, y terrain shadow, z cloud shadow
 } u;
 
 // Shared with the cloud pass: cloud water volume + terrain height, for shadow marches.
@@ -69,6 +70,17 @@ float fbm(vec2 p)
         amp *= 0.5;
     }
     return sum;
+}
+float fbm3(vec2 p)
+{
+    float sum = 0.0;
+    float amp = 0.5;
+    for (int i = 0; i < 3; ++i) {
+        sum += noise(p) * amp;
+        p *= 2.03;
+        amp *= 0.5;
+    }
+    return sum / 0.875;
 }
 
 // ---- textured materials ------------------------------------------------------------
@@ -123,6 +135,7 @@ vec3 planar(float layer, vec2 uv, float v, out vec2 tn)
 // textures stop smearing into vertical streaks.
 vec3 material(float layer, vec3 p, vec3 gN, float v, out vec2 tn)
 {
+    if (u.quality.x < 0.5) { tn = vec2(0.0); return vec3(0.35, 0.36, 0.30); }
     vec3 w = pow(abs(gN), vec3(6.0));
     w /= (w.x + w.y + w.z);
     vec3 col = vec3(0.0);
@@ -166,16 +179,16 @@ float qcAt(vec3 p)
 // angular clearance (classic penumbra approximation). Growing steps keep it ~20 taps.
 float sunTerrainShadow(vec3 wp, vec3 sd)
 {
-    if (u.shadowParams.x < 0.5 || sd.y <= 0.03) return 1.0;
+    if (u.shadowParams.x < 0.5 || sd.y <= 0.03 || u.quality.y < 0.5) return 1.0;
     float res = 1.0;
     float t = 2.2;
-    for (int i = 0; i < 22; ++i) {
+    for (int i = 0; i < 14; ++i) {
         vec3 p = wp + sd * t;
         if (p.y > u.terrain.x + 8.0) break; // above any possible terrain
         float h = terrainH(p.xz);
         res = min(res, 6.0 * (p.y - h + 0.9) / t);
         if (res < 0.0) break;
-        t += clamp(t * 0.32, 1.1, 7.0);
+        t += clamp(t * 0.48, 1.4, 10.0);
     }
     // Fade out at grazing sun angles: the coarse heightmap aliases into dappled noise
     // there, and direct light is nearly gone at the horizon anyway.
@@ -186,7 +199,7 @@ float sunTerrainShadow(vec3 wp, vec3 sd)
 float cloudShadow(vec3 wp, vec3 sd)
 {
     float strength = u.shadowParams.y;
-    if (strength <= 0.0 || sd.y <= 0.05) return 1.0;
+    if (strength <= 0.0 || sd.y <= 0.05 || u.quality.z < 0.5) return 1.0;
     // Cap the path length: at grazing sun the ray would otherwise sweep the whole
     // volume diagonally and alias the coarse cloud grid into patchy bands.
     float tTop = min((u.volMax.y - wp.y) / max(sd.y, 0.10), 300.0);
@@ -231,8 +244,8 @@ void main()
 
     float broad = fbm(p * 0.055);
     float medium = fbm(p * 0.23);
-    float fine = fbm(p * 1.65);
-    float ntVar = fbm(p * 0.09);
+    float fine = fbm3(p * 1.65);
+    float ntVar = fbm3(p * 0.09);
 
     vec4 eco = ecoAt(p);
     float flow = eco.r;
@@ -281,7 +294,7 @@ void main()
     }
     if (forest > 0.03) {
         vec3 c = material(3.0, vWorldPos, gN, ntVar, tn);
-        float canopy = fbm(p * 0.45);
+        float canopy = fbm3(p * 0.45);
         c *= vec3(0.22, 0.36, 0.17) * (0.70 + 0.6 * canopy) * (1.0 - drainage * 0.25);
         base = mix(base, c, forest); tnAcc = mix(tnAcc, tn + (canopy - 0.5) * 0.4, forest);
     }
@@ -294,7 +307,7 @@ void main()
     }
     if (rock > 0.03) {
         vec3 c = material(0.0, vWorldPos, gN, ntVar, tn);
-        float strata = fbm(vec2(vWorldPos.x * 0.08, vWorldPos.y * 0.55));
+        float strata = fbm3(vec2(vWorldPos.x * 0.08, vWorldPos.y * 0.55));
         float rl = dot(c, vec3(0.3, 0.59, 0.11));
         // Bare rock is grey with a cool cast; only the strata bands keep a little warmth.
         c = mix(vec3(rl), c, 0.35) * vec3(0.86, 0.88, 0.92);

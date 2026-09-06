@@ -66,7 +66,9 @@ private:
     // 4x MSAA: scene renders into a transient multisampled color target that resolves
     // into the swapchain image at the end of the pass. On Apple TBDR GPUs both MSAA
     // attachments can live in tile memory (lazily allocated), so this is close to free.
-    static constexpr VkSampleCountFlagBits kMsaaSamples = VK_SAMPLE_COUNT_4_BIT;
+    // 2x by default: the textured terrain shader is fragment-bound and 4x cost a full extra
+    // frame at retina resolution. MS_MSAA=1|2|4 overrides at startup.
+    VkSampleCountFlagBits kMsaaSamples = VK_SAMPLE_COUNT_2_BIT;
     VkImage colorImage_ = VK_NULL_HANDLE;
     VkDeviceMemory colorMemory_ = VK_NULL_HANDLE;
     VkImageView colorView_ = VK_NULL_HANDLE;
@@ -141,6 +143,7 @@ private:
     int pendingDrops_ = 0;          // live erosion: droplets not yet spawned
     int erosionFrame_ = 0;
     float frameMsAvg_ = 0.0f;
+    glm::vec3 quality_{1.0f, 1.0f, 1.0f};
     // MS_SHOT=path.ppm MS_SHOT_FRAME=N : write the Nth frame to disk and quit.
     std::string shotPath_;
     int shotFrame_ = 60;
@@ -272,6 +275,12 @@ private:
         if (const char* sp = std::getenv("MS_SHOT")) shotPath_ = sp;
         if (const char* sf = std::getenv("MS_SHOT_FRAME")) shotFrame_ = std::atoi(sf);
         if (std::getenv("MS_NOVEG")) showVegetation_ = false;
+        if (std::getenv("MS_NOWEATHER")) weatherEnabled_ = false;
+        if (const char* q = std::getenv("MS_QUALITY")) std::sscanf(q, "%f,%f,%f", &quality_.x, &quality_.y, &quality_.z);
+        if (const char* m = std::getenv("MS_MSAA")) {
+            int n = std::atoi(m);
+            kMsaaSamples = (n <= 1) ? VK_SAMPLE_COUNT_1_BIT : (n == 2) ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_4_BIT;
+        }
         if (const char* er = std::getenv("MS_ERODE")) {
             int drops = std::atoi(er);
             if (drops > 0) { terrain_.erode(drops); terrainDirty_ = true; }
@@ -1690,7 +1699,7 @@ private:
         si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         si.anisotropyEnable = VK_TRUE;
-        si.maxAnisotropy = 16.0f;
+        si.maxAnisotropy = 4.0f;
         si.maxLod = VK_LOD_CLAMP_NONE;
         checkVk(vkCreateSampler(device_, &si, nullptr, &matSampler_), "Failed to create material sampler");
     }
@@ -2243,6 +2252,7 @@ private:
         ubo.shadowParams = glm::vec4(sunShadows_ ? 1.0f : 0.0f,
                                      (cloudShadows_ && anyCloud) ? 1.0f : 0.0f, moonPhase_, cloudDetail_);
         ubo.material = glm::vec4(texMacro_, texMid_, texNear_, static_cast<float>(kTerrainSize));
+        ubo.quality = glm::vec4(quality_, 1.0f);
         void* data = nullptr;
         vkMapMemory(device_, uniformMemories_[frame], 0, sizeof(ubo), 0, &data);
         std::memcpy(data, &ubo, sizeof(ubo));

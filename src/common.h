@@ -49,6 +49,7 @@ struct SceneUniforms {
     glm::vec4 lightning{};       // xyz = world position of the active flash, w = intensity
     glm::vec4 shadowParams{};    // x = terrain sun-shadows, y = cloud shadows, w = cloud detail
     glm::vec4 material{};        // x = macro tile (world units), y = mid tile, z = near tile, w = grid res
+    glm::vec4 quality{1.0f, 1.0f, 1.0f, 1.0f}; // x textures, y terrain shadow, z cloud shadow, w unused (debug switches)
 };
 
 inline std::vector<char> readBinaryFile(const std::string& path)
