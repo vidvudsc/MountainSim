@@ -10,8 +10,13 @@
 #include <string>
 #include <vector>
 
-constexpr int kTerrainSize = 193;
+// 641 = 192 * 3.33 + 1: the generation recipe is unchanged, resolved at ~11x the vertices.
+constexpr int kTerrainSize = 641;
 constexpr float kTerrainWorldSize = 165.0f;
+// Grid steps relative to the original 193 tuning; erosion parameters are scaled by this.
+constexpr float kGridScale = static_cast<float>(kTerrainSize - 1) / 192.0f;
+// Visual scale for placed objects (trees, boulders): the box reads as ~10 km across.
+constexpr float kMetersPerUnit = 60.0f;
 constexpr int kMaxFramesInFlight = 2;
 
 struct Vertex {
@@ -42,7 +47,8 @@ struct SceneUniforms {
     glm::vec4 cloudGrid{};       // x,y,z = grid dims; w = heightmap resolution
     glm::vec4 cloudParams{};     // x density, y steps, z sun absorption, w coverage bias
     glm::vec4 lightning{};       // xyz = world position of the active flash, w = intensity
-    glm::vec4 shadowParams{};    // x = terrain sun-shadows on/off, y = cloud-shadow strength
+    glm::vec4 shadowParams{};    // x = terrain sun-shadows, y = cloud shadows, w = cloud detail
+    glm::vec4 material{};        // x = macro tile (world units), y = mid tile, z = near tile, w = grid res
 };
 
 inline std::vector<char> readBinaryFile(const std::string& path)

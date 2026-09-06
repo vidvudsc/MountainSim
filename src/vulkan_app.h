@@ -13,6 +13,7 @@
 #include "camera.h"
 #include "common.h"
 #include "terrain.h"
+#include "veg.h"
 #include "weather.h"
 
 #include <algorithm>
@@ -21,6 +22,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -93,11 +96,55 @@ private:
     Terrain terrain_;
     Camera camera_;
     bool terrainDirty_ = true;
+
+    // --- terrain material textures: Poly Haven CC0 albedo + normal 2D arrays, mipmapped.
+    //     Layer order: rock, scree, grass, forest, snow, marsh ---
+    static constexpr std::uint32_t kMatLayers = 6;
+    VkImage matAlbedoImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory matAlbedoMemory_ = VK_NULL_HANDLE;
+    VkImageView matAlbedoView_ = VK_NULL_HANDLE;
+    VkImage matNormalImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory matNormalMemory_ = VK_NULL_HANDLE;
+    VkImageView matNormalView_ = VK_NULL_HANDLE;
+    VkSampler matSampler_ = VK_NULL_HANDLE;
+    // Ecology map (flow, curvature, forest, sky view) at terrain resolution.
+    VkImage ecoImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory ecoMemory_ = VK_NULL_HANDLE;
+    VkImageView ecoView_ = VK_NULL_HANDLE;
+    VkSampler ecoSampler_ = VK_NULL_HANDLE;
+    // --- vegetation (instanced trees, boulders, grass) ---
+    Vegetation veg_;
+    bool showVegetation_ = true;
+    VkPipeline vegPipeline_ = VK_NULL_HANDLE;
+    VkBuffer vegVertexBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory vegVertexMemory_ = VK_NULL_HANDLE;
+    VkBuffer vegIndexBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory vegIndexMemory_ = VK_NULL_HANDLE;
+    std::array<VkBuffer, kMaxFramesInFlight> vegInstanceBuffers_{};
+    std::array<VkDeviceMemory, kMaxFramesInFlight> vegInstanceMemories_{};
+    std::array<void*, kMaxFramesInFlight> vegInstanceMapped_{};
+    std::array<Vegetation::DrawGroups, kMaxFramesInFlight> vegGroups_{};
+    float texMacro_ = 9.0f;   // world units per repeat of the large tile
+    float texMid_ = 1.2f;
+    float texNear_ = 0.22f;
     bool wireframe_ = false;
     bool showFlowParticles_ = true;
     bool erosionAnimating_ = false;
     float erosionSpeed_ = 0.35f;
     bool framebufferResized_ = false;
+    bool hideUi_ = false;
+    // Walk mode: first-person camera glued to the ground (F toggles). WASD walks, mouse
+    // drag looks, Space/Ctrl fly up/down, Shift sprints.
+    bool walkMode_ = false;
+    bool walkKeyDown_ = false;
+    float walkSpeedMps_ = 9.0f;
+    int pendingDrops_ = 0;          // live erosion: droplets not yet spawned
+    int erosionFrame_ = 0;
+    float frameMsAvg_ = 0.0f;
+    // MS_SHOT=path.ppm MS_SHOT_FRAME=N : write the Nth frame to disk and quit.
+    std::string shotPath_;
+    int shotFrame_ = 60;
+    int frameCounter_ = 0;
 
     // --- weather / microclimate ---
     Weather weather_;
@@ -133,6 +180,7 @@ private:
     int cloudSteps_ = 48;               // primary march samples
     float cloudSunAbsorb_ = 1.0f;       // self-shadow strength
     float cloudCoverage_ = 0.0f;        // density floor (trims wisps)
+    float cloudDetail_ = 0.35f;         // sub-grid turbulent erosion inside simulated cloud
     static constexpr int kCloudHeightRes = 384;                 // occlusion/shadow heightmap resolution
     static constexpr int kCloudMaxCells = 144 * 96 * 144;       // SSBO capacity (grid slider maxima)
     VkDescriptorSetLayout cloudSetLayout_ = VK_NULL_HANDLE;
@@ -204,6 +252,30 @@ private:
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
         window_ = glfwCreateWindow(1440, 900, "Mountains - Vulkan Terrain", nullptr, nullptr);
         if (!window_) throw std::runtime_error("Failed to create window");
+        // MS_CAM="yaw,pitch,dist,tx,ty,tz"  MS_TIME=hour  MS_NOUI=1 : repeatable screenshots.
+        if (const char* cam = std::getenv("MS_CAM")) {
+            float v[6] = {camera_.yaw, camera_.pitch, camera_.distance, camera_.target.x, camera_.target.y, camera_.target.z};
+            std::sscanf(cam, "%f,%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
+            camera_.yaw = v[0]; camera_.pitch = v[1]; camera_.distance = v[2];
+            camera_.target = glm::vec3(v[3], v[4], v[5]);
+        }
+        if (const char* t = std::getenv("MS_TIME")) { timeOfDay_ = static_cast<float>(std::atof(t)); clockAuto_ = false; }
+        // MS_WALK="x,z,yaw,pitch" : start in walk mode standing at x,z.
+        if (const char* wk = std::getenv("MS_WALK")) {
+            float v[4] = {0, 0, -90, 0};
+            std::sscanf(wk, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]);
+            walkMode_ = true;
+            camera_.position = glm::vec3(v[0], 0.0f, v[1]);
+            camera_.yaw = v[2]; camera_.pitch = v[3];
+        }
+        if (std::getenv("MS_NOUI")) hideUi_ = true;
+        if (const char* sp = std::getenv("MS_SHOT")) shotPath_ = sp;
+        if (const char* sf = std::getenv("MS_SHOT_FRAME")) shotFrame_ = std::atoi(sf);
+        if (std::getenv("MS_NOVEG")) showVegetation_ = false;
+        if (const char* er = std::getenv("MS_ERODE")) {
+            int drops = std::atoi(er);
+            if (drops > 0) { terrain_.erode(drops); terrainDirty_ = true; }
+        }
         camera_.updateFromOrbit();
         glfwSetWindowUserPointer(window_, this);
         glfwSetScrollCallback(window_, [](GLFWwindow* window, double xOffset, double yOffset) {
@@ -235,7 +307,11 @@ private:
         createFramebuffers();
         createCommandPool();
         createSkyboxResources();
+        createTerrainTextures();
+        createEcoTexture();
         createTerrainBuffers();
+        veg_.place(terrain_, terrain_.settings().seed);
+        createVegBuffers();
         createUniformBuffers();
         createCloudResources();
         createDescriptorPool();
@@ -383,6 +459,7 @@ private:
         const std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME, "VK_KHR_portability_subset"};
         VkPhysicalDeviceFeatures features{};
         features.fillModeNonSolid = VK_TRUE;
+        features.samplerAnisotropy = VK_TRUE; // terrain textures at grazing angles
         VkDeviceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         createInfo.queueCreateInfoCount = static_cast<std::uint32_t>(queues.size());
@@ -440,7 +517,7 @@ private:
         createInfo.imageColorSpace = surfaceFormat.colorSpace;
         createInfo.imageExtent = swapchainExtent_;
         createInfo.imageArrayLayers = 1;
-        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice_);
         std::array<std::uint32_t, 2> families{*indices.graphics, *indices.present};
         if (indices.graphics != indices.present) {
@@ -557,7 +634,16 @@ private:
         heightMap.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         heightMap.descriptorCount = 1;
         heightMap.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        std::array<VkDescriptorSetLayoutBinding, 4> bindings{ubo, skybox, cloudVol, heightMap};
+        VkDescriptorSetLayoutBinding matAlb{};
+        matAlb.binding = 4;
+        matAlb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        matAlb.descriptorCount = 1;
+        matAlb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutBinding matNor = matAlb;
+        matNor.binding = 5;
+        VkDescriptorSetLayoutBinding eco = matAlb;
+        eco.binding = 6;
+        std::array<VkDescriptorSetLayoutBinding, 7> bindings{ubo, skybox, cloudVol, heightMap, matAlb, matNor, eco};
         VkDescriptorSetLayoutCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         createInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
@@ -584,6 +670,7 @@ private:
         checkVk(vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &pipelineLayout_), "Failed to create pipeline layout");
         createSkyPipeline();
         createTerrainPipeline();
+        createVegPipeline();
     }
 
     void createTerrainPipeline()
@@ -655,6 +742,123 @@ private:
         checkVk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline_), "Failed to create graphics pipeline");
         vkDestroyShaderModule(device_, vert, nullptr);
         vkDestroyShaderModule(device_, frag, nullptr);
+    }
+
+    void createVegPipeline()
+    {
+        VkShaderModule vert = createShaderModule(readBinaryFile(std::string(SHADER_BINARY_DIR) + "/veg.vert.spv"));
+        VkShaderModule frag = createShaderModule(readBinaryFile(std::string(SHADER_BINARY_DIR) + "/veg.frag.spv"));
+        VkPipelineShaderStageCreateInfo vertStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT; vertStage.module = vert; vertStage.pName = "main";
+        VkPipelineShaderStageCreateInfo fragStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT; fragStage.module = frag; fragStage.pName = "main";
+        std::array<VkPipelineShaderStageCreateInfo, 2> stages{vertStage, fragStage};
+
+        std::array<VkVertexInputBindingDescription, 2> bindings{{
+            {0, sizeof(VegVertex), VK_VERTEX_INPUT_RATE_VERTEX},
+            {1, sizeof(VegInstanceGpu), VK_VERTEX_INPUT_RATE_INSTANCE},
+        }};
+        std::array<VkVertexInputAttributeDescription, 5> attributes{{
+            {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VegVertex, position)},
+            {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VegVertex, normal)},
+            {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VegVertex, color)},
+            {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VegInstanceGpu, posScale)},
+            {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VegInstanceGpu, rotType)},
+        }};
+        VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        vertexInput.vertexBindingDescriptionCount = static_cast<std::uint32_t>(bindings.size());
+        vertexInput.pVertexBindingDescriptions = bindings.data();
+        vertexInput.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());
+        vertexInput.pVertexAttributeDescriptions = attributes.data();
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewportState.viewportCount = 1; viewportState.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.polygonMode = VK_POLYGON_MODE_FILL;
+        raster.cullMode = VK_CULL_MODE_NONE;
+        raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        raster.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        multisample.rasterizationSamples = kMsaaSamples;
+        VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        depth.depthTestEnable = VK_TRUE; depth.depthWriteEnable = VK_TRUE; depth.depthCompareOp = VK_COMPARE_OP_LESS;
+        VkPipelineColorBlendAttachmentState blendAttachment{};
+        blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        blend.attachmentCount = 1; blend.pAttachments = &blendAttachment;
+        std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
+        dynamic.pDynamicStates = dynamicStates.data();
+        VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
+        pipelineInfo.pStages = stages.data();
+        pipelineInfo.pVertexInputState = &vertexInput;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &raster;
+        pipelineInfo.pMultisampleState = &multisample;
+        pipelineInfo.pDepthStencilState = &depth;
+        pipelineInfo.pColorBlendState = &blend;
+        pipelineInfo.pDynamicState = &dynamic;
+        pipelineInfo.layout = pipelineLayout_;
+        pipelineInfo.renderPass = renderPass_;
+        pipelineInfo.subpass = 0;
+        checkVk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vegPipeline_), "Failed to create vegetation pipeline");
+        vkDestroyShaderModule(device_, vert, nullptr);
+        vkDestroyShaderModule(device_, frag, nullptr);
+    }
+
+    void createVegBuffers()
+    {
+        createBuffer(sizeof(VegVertex) * veg_.vertices.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, vegVertexBuffer_, vegVertexMemory_);
+        createBuffer(sizeof(std::uint32_t) * veg_.indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, vegIndexBuffer_, vegIndexMemory_);
+        void* data = nullptr;
+        vkMapMemory(device_, vegVertexMemory_, 0, VK_WHOLE_SIZE, 0, &data);
+        std::memcpy(data, veg_.vertices.data(), sizeof(VegVertex) * veg_.vertices.size());
+        vkUnmapMemory(device_, vegVertexMemory_);
+        vkMapMemory(device_, vegIndexMemory_, 0, VK_WHOLE_SIZE, 0, &data);
+        std::memcpy(data, veg_.indices.data(), sizeof(std::uint32_t) * veg_.indices.size());
+        vkUnmapMemory(device_, vegIndexMemory_);
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            createBuffer(sizeof(VegInstanceGpu) * Vegetation::kMaxInstances, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         vegInstanceBuffers_[i], vegInstanceMemories_[i]);
+            vkMapMemory(device_, vegInstanceMemories_[i], 0, VK_WHOLE_SIZE, 0, &vegInstanceMapped_[i]);
+        }
+    }
+
+    void updateVegetation(std::uint32_t frame)
+    {
+        if (!showVegetation_ || !vegInstanceMapped_[frame]) { vegGroups_[frame] = {}; return; }
+        glm::vec3 fwd = glm::normalize(camera_.target - camera_.position);
+        vegGroups_[frame] = veg_.gather(terrain_, camera_.position, fwd,
+                                        static_cast<VegInstanceGpu*>(vegInstanceMapped_[frame]), Vegetation::kMaxInstances);
+    }
+
+    void drawVegetation(VkCommandBuffer cmd)
+    {
+        const Vegetation::DrawGroups& g = vegGroups_[currentFrame_];
+        std::uint32_t total = g.conifer[1] + g.broadleaf[1] + g.boulder[1] + g.billboard[1] + g.grass[1];
+        if (!showVegetation_ || total == 0) return;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vegPipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
+        std::array<VkBuffer, 2> vbs{vegVertexBuffer_, vegInstanceBuffers_[currentFrame_]};
+        std::array<VkDeviceSize, 2> offs{0, 0};
+        vkCmdBindVertexBuffers(cmd, 0, 2, vbs.data(), offs.data());
+        vkCmdBindIndexBuffer(cmd, vegIndexBuffer_, 0, VK_INDEX_TYPE_UINT32);
+        auto draw = [&](const VegMeshRange& m, const std::uint32_t* grp) {
+            if (grp[1] == 0) return;
+            vkCmdDrawIndexed(cmd, m.indexCount, grp[1], m.firstIndex, m.vertexOffset, grp[0]);
+        };
+        draw(veg_.conifer, g.conifer);
+        draw(veg_.broadleaf, g.broadleaf);
+        draw(veg_.boulder, g.boulder);
+        draw(veg_.billboard, g.billboard);
+        draw(veg_.grass, g.grass);
     }
 
     void createSkyPipeline()
@@ -1359,6 +1563,203 @@ private:
         checkVk(vkCreateSampler(device_, &sampler, nullptr, &skyboxSampler_), "Failed to create skybox sampler");
     }
 
+    // Build one mipmapped 2D-array texture from per-layer image files. Missing or
+    // mismatched files fall back to a neutral layer so the app runs without the assets.
+    void createMaterialArray(const std::array<std::string, kMatLayers>& paths, VkFormat format, bool isNormal,
+                             VkImage& image, VkDeviceMemory& memory, VkImageView& view)
+    {
+        int W = 0, H = 0;
+        std::array<stbi_uc*, kMatLayers> data{};
+        for (std::uint32_t i = 0; i < kMatLayers; ++i) {
+            int w = 0, h = 0, c = 0;
+            data[i] = stbi_load(paths[i].c_str(), &w, &h, &c, STBI_rgb_alpha);
+            if (data[i] && W == 0) { W = w; H = h; }
+            if (data[i] && (w != W || h != H)) { stbi_image_free(data[i]); data[i] = nullptr; }
+            if (!data[i]) std::cout << "Terrain texture missing/mismatched, using neutral: " << paths[i] << "\n";
+        }
+        if (W == 0) { W = 4; H = 4; }
+
+        VkDeviceSize layerBytes = static_cast<VkDeviceSize>(W) * H * 4;
+        VkBuffer staging = VK_NULL_HANDLE;
+        VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+        createBuffer(layerBytes * kMatLayers, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMemory);
+        void* mapped = nullptr;
+        vkMapMemory(device_, stagingMemory, 0, layerBytes * kMatLayers, 0, &mapped);
+        for (std::uint32_t i = 0; i < kMatLayers; ++i) {
+            auto* dst = static_cast<stbi_uc*>(mapped) + layerBytes * i;
+            if (data[i]) {
+                std::memcpy(dst, data[i], layerBytes);
+                stbi_image_free(data[i]);
+            } else {
+                stbi_uc neutral[4] = {140, 140, 140, 255};
+                if (isNormal) { neutral[0] = 128; neutral[1] = 128; neutral[2] = 255; }
+                for (VkDeviceSize q = 0; q < layerBytes; q += 4) std::memcpy(dst + q, neutral, 4);
+            }
+        }
+        vkUnmapMemory(device_, stagingMemory);
+
+        std::uint32_t mips = 1 + static_cast<std::uint32_t>(std::floor(std::log2(std::max(W, H))));
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.extent = {static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(H), 1};
+        ii.mipLevels = mips;
+        ii.arrayLayers = kMatLayers;
+        ii.format = format;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        checkVk(vkCreateImage(device_, &ii, nullptr, &image), "Failed to create material array image");
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(device_, image, &req);
+        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        checkVk(vkAllocateMemory(device_, &alloc, nullptr, &memory), "Failed to allocate material array memory");
+        vkBindImageMemory(device_, image, memory, 0);
+
+        VkCommandBuffer cmd = beginSingleTimeCommands();
+        auto barrier = [&](std::uint32_t baseMip, std::uint32_t mipCount, VkImageLayout oldL, VkImageLayout newL,
+                           VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = oldL; b.newLayout = newL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = image;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, baseMip, mipCount, 0, kMatLayers};
+            b.srcAccessMask = srcA; b.dstAccessMask = dstA;
+            vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+        };
+        barrier(0, mips, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, kMatLayers};
+        region.imageExtent = {static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(H), 1};
+        vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        int mipW = W, mipH = H;
+        for (std::uint32_t i = 1; i < mips; ++i) {
+            barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, kMatLayers};
+            blit.srcOffsets[1] = {mipW, mipH, 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, kMatLayers};
+            blit.dstOffsets[1] = {std::max(mipW / 2, 1), std::max(mipH / 2, 1), 1};
+            vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+            barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            mipW = std::max(mipW / 2, 1);
+            mipH = std::max(mipH / 2, 1);
+        }
+        barrier(mips - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        endSingleTimeCommands(cmd);
+        vkDestroyBuffer(device_, staging, nullptr);
+        vkFreeMemory(device_, stagingMemory, nullptr);
+
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        vi.format = format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, kMatLayers};
+        checkVk(vkCreateImageView(device_, &vi, nullptr, &view), "Failed to create material array view");
+    }
+
+    void createTerrainTextures()
+    {
+        const std::array<std::string, kMatLayers> names{
+            "aerial_rocks_02", "aerial_rocks_04", "rocky_terrain_02", "forrest_ground_01", "snow_02", "aerial_grass_rock"};
+        std::array<std::string, kMatLayers> diff{}, nor{};
+        for (std::uint32_t i = 0; i < kMatLayers; ++i) {
+            diff[i] = "assets/textures/" + names[i] + "_diff.png";
+            nor[i] = "assets/textures/" + names[i] + "_nor_gl.png";
+            std::ifstream pngD(diff[i]), pngN(nor[i]);
+            if (!pngD) diff[i] = "assets/textures/" + names[i] + "_diff.jpg";
+            if (!pngN) nor[i] = "assets/textures/" + names[i] + "_nor_gl.jpg";
+        }
+        createMaterialArray(diff, VK_FORMAT_R8G8B8A8_SRGB, false, matAlbedoImage_, matAlbedoMemory_, matAlbedoView_);
+        createMaterialArray(nor, VK_FORMAT_R8G8B8A8_UNORM, true, matNormalImage_, matNormalMemory_, matNormalView_);
+
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = VK_FILTER_LINEAR;
+        si.minFilter = VK_FILTER_LINEAR;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.anisotropyEnable = VK_TRUE;
+        si.maxAnisotropy = 16.0f;
+        si.maxLod = VK_LOD_CLAMP_NONE;
+        checkVk(vkCreateSampler(device_, &si, nullptr, &matSampler_), "Failed to create material sampler");
+    }
+
+    void destroyEcoTexture()
+    {
+        if (ecoView_) vkDestroyImageView(device_, ecoView_, nullptr);
+        if (ecoImage_) vkDestroyImage(device_, ecoImage_, nullptr);
+        if (ecoMemory_) vkFreeMemory(device_, ecoMemory_, nullptr);
+        ecoView_ = VK_NULL_HANDLE; ecoImage_ = VK_NULL_HANDLE; ecoMemory_ = VK_NULL_HANDLE;
+    }
+
+    // Ecology map: RGBA8 at terrain resolution (flow, curvature, forest, sky view).
+    void createEcoTexture()
+    {
+        destroyEcoTexture();
+        const std::vector<std::uint8_t>& px = terrain_.ecoPixels();
+        const std::uint32_t N = static_cast<std::uint32_t>(kTerrainSize);
+        VkDeviceSize bytes = static_cast<VkDeviceSize>(px.size());
+        VkBuffer staging = VK_NULL_HANDLE;
+        VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+        createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMemory);
+        void* mapped = nullptr;
+        vkMapMemory(device_, stagingMemory, 0, bytes, 0, &mapped);
+        std::memcpy(mapped, px.data(), px.size());
+        vkUnmapMemory(device_, stagingMemory);
+        createImage(N, N, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, ecoImage_, ecoMemory_);
+        transitionImageLayout(ecoImage_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1);
+        copyBufferToImage(staging, ecoImage_, N, N, 1);
+        transitionImageLayout(ecoImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1);
+        vkDestroyBuffer(device_, staging, nullptr);
+        vkFreeMemory(device_, stagingMemory, nullptr);
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = ecoImage_;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        checkVk(vkCreateImageView(device_, &vi, nullptr, &ecoView_), "Failed to create eco view");
+        if (ecoSampler_ == VK_NULL_HANDLE) {
+            VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            si.magFilter = VK_FILTER_LINEAR;
+            si.minFilter = VK_FILTER_LINEAR;
+            si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            si.maxLod = 1.0f;
+            checkVk(vkCreateSampler(device_, &si, nullptr, &ecoSampler_), "Failed to create eco sampler");
+        }
+    }
+
+    // After a terrain change: rebuild the eco map and point both frames' descriptors at it.
+    void refreshEcoTexture()
+    {
+        vkDeviceWaitIdle(device_);
+        createEcoTexture();
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            VkDescriptorImageInfo ecoInfo{ecoSampler_, ecoView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = descriptorSets_[i];
+            w.dstBinding = 6;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w.descriptorCount = 1;
+            w.pImageInfo = &ecoInfo;
+            vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+        }
+    }
+
     void createDepthResources()
     {
         createImage(swapchainExtent_.width, swapchainExtent_.height, VK_FORMAT_D32_SFLOAT,
@@ -1471,7 +1872,7 @@ private:
     {
         std::array<VkDescriptorPoolSize, 2> poolSizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * kMaxFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 * kMaxFramesInFlight},
         }};
         VkDescriptorPoolCreateInfo createInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         createInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
@@ -1497,7 +1898,18 @@ private:
             imageInfo.sampler = skyboxSampler_;
             VkDescriptorImageInfo cloudInfo{cloudSampler_, cloudFieldViews_[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkDescriptorImageInfo hgtInfo{cloudSampler_, cloudHeightView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            std::array<VkWriteDescriptorSet, 4> writes{};
+            VkDescriptorImageInfo albInfo{matSampler_, matAlbedoView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkDescriptorImageInfo norInfo{matSampler_, matNormalView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkDescriptorImageInfo ecoInfo{ecoSampler_, ecoView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            std::array<VkWriteDescriptorSet, 7> writes{};
+            for (std::uint32_t b = 4; b <= 6; ++b) {
+                writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[b].dstSet = descriptorSets_[i];
+                writes[b].dstBinding = b;
+                writes[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[b].descriptorCount = 1;
+                writes[b].pImageInfo = (b == 4) ? &albInfo : (b == 5) ? &norInfo : &ecoInfo;
+            }
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = descriptorSets_[i];
             writes[0].dstBinding = 0;
@@ -1603,19 +2015,85 @@ private:
 
     void onScroll(double xOffset, double yOffset)
     {
+        if (walkMode_) { walkSpeedMps_ = glm::clamp(walkSpeedMps_ * std::pow(1.15f, static_cast<float>(yOffset)), 1.5f, 120.0f); return; }
         if (ImGui::GetIO().WantCaptureMouse && !camera_.orbiting && !camera_.panning) return;
         glm::vec3 forward = glm::normalize(camera_.target - camera_.position);
         glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
         float scale = camera_.distance * camera_.panSpeed * 0.055f;
         camera_.distance *= std::pow(0.86f, static_cast<float>(yOffset));
-        camera_.distance = glm::clamp(camera_.distance, 16.0f, 260.0f);
+        camera_.distance = glm::clamp(camera_.distance, 0.6f, 260.0f);
         camera_.target += (-right * static_cast<float>(xOffset)) * scale;
         camera_.lastInput = "two-finger zoom";
         camera_.updateFromOrbit();
     }
 
+    void updateWalkCamera(float dt)
+    {
+        bool leftMouse = glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+        bool rightMouse = glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+        bool canDrag = !ImGui::GetIO().WantCaptureMouse || camera_.orbiting;
+        bool wantsLook = (leftMouse || rightMouse) && canDrag;
+        if (wantsLook) {
+            if (!camera_.orbiting) { glfwSetInputMode(window_, GLFW_CURSOR, GLFW_CURSOR_DISABLED); camera_.firstMouse = true; }
+            camera_.orbiting = true;
+        } else if (camera_.orbiting) {
+            camera_.orbiting = false;
+            glfwSetInputMode(window_, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        }
+        if (camera_.orbiting) {
+            double mx = 0.0, my = 0.0;
+            glfwGetCursorPos(window_, &mx, &my);
+            if (camera_.firstMouse) { camera_.lastMouseX = mx; camera_.lastMouseY = my; camera_.firstMouse = false; }
+            float dx = static_cast<float>(mx - camera_.lastMouseX);
+            float dy = static_cast<float>(camera_.lastMouseY - my);
+            camera_.lastMouseX = mx; camera_.lastMouseY = my;
+            camera_.yaw += dx * 0.12f;
+            camera_.pitch = glm::clamp(camera_.pitch + dy * 0.12f, -85.0f, 85.0f);
+            camera_.lastInput = "walk look";
+        }
+        glm::vec3 fwd = camera_.forward();
+        glm::vec3 planar = glm::normalize(glm::vec3(fwd.x, 0.0f, fwd.z));
+        glm::vec3 right = glm::normalize(glm::cross(planar, glm::vec3(0.0f, 1.0f, 0.0f)));
+        bool flying = false;
+        if (!ImGui::GetIO().WantTextInput) {
+            float speed = walkSpeedMps_ / kMetersPerUnit * dt;
+            if (glfwGetKey(window_, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) speed *= 6.0f;
+            if (glfwGetKey(window_, GLFW_KEY_W) == GLFW_PRESS) camera_.position += planar * speed;
+            if (glfwGetKey(window_, GLFW_KEY_S) == GLFW_PRESS) camera_.position -= planar * speed;
+            if (glfwGetKey(window_, GLFW_KEY_A) == GLFW_PRESS) camera_.position -= right * speed;
+            if (glfwGetKey(window_, GLFW_KEY_D) == GLFW_PRESS) camera_.position += right * speed;
+            if (glfwGetKey(window_, GLFW_KEY_SPACE) == GLFW_PRESS) { camera_.position.y += speed; flying = true; }
+            if (glfwGetKey(window_, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) { camera_.position.y -= speed; flying = true; }
+        }
+        float half = kTerrainWorldSize * 0.5f - 0.5f;
+        camera_.position.x = glm::clamp(camera_.position.x, -half, half);
+        camera_.position.z = glm::clamp(camera_.position.z, -half, half);
+        float eye = terrain_.surfaceHeightAtWorld(camera_.position.x, camera_.position.z) + 1.75f / kMetersPerUnit;
+        if (!flying || camera_.position.y < eye) camera_.position.y = glm::mix(camera_.position.y, eye, flying ? 1.0f : glm::clamp(dt * 12.0f, 0.0f, 1.0f));
+        if (!flying) camera_.position.y = std::max(camera_.position.y, eye);
+        camera_.target = camera_.position + fwd;
+        camera_.distance = 1.0f;
+    }
+
     void processInput(float dt)
     {
+        bool fKey = glfwGetKey(window_, GLFW_KEY_F) == GLFW_PRESS && !ImGui::GetIO().WantTextInput;
+        if (fKey && !walkKeyDown_) {
+            walkMode_ = !walkMode_;
+            if (walkMode_) {
+                // Drop the walker where the orbit target was, facing the same way.
+                glm::vec3 fwd = camera_.forward();
+                camera_.position = camera_.target;
+                camera_.pitch = glm::clamp(camera_.pitch, -30.0f, 30.0f);
+                (void)fwd;
+            } else {
+                camera_.target = camera_.position + camera_.forward() * 20.0f;
+                camera_.distance = 20.0f;
+                camera_.updateFromOrbit();
+            }
+        }
+        walkKeyDown_ = fKey;
+        if (walkMode_) { updateWalkCamera(dt); return; }
         bool leftMouse = glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
         bool rightMouse = glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
         bool middleMouse = glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
@@ -1713,9 +2191,25 @@ private:
         }
     }
 
+    void clampCameraAboveGround()
+    {
+        if (walkMode_) return;
+        float half = kTerrainWorldSize * 0.5f;
+        if (std::abs(camera_.position.x) < half && std::abs(camera_.position.z) < half) {
+            float ground = terrain_.surfaceHeightAtWorld(camera_.position.x, camera_.position.z) + 1.8f / kMetersPerUnit;
+            if (camera_.position.y < ground) camera_.position.y = ground;
+        }
+        float tHalf = half;
+        if (std::abs(camera_.target.x) < tHalf && std::abs(camera_.target.z) < tHalf) {
+            float ground = terrain_.surfaceHeightAtWorld(camera_.target.x, camera_.target.z) + 0.5f / kMetersPerUnit;
+            if (camera_.target.y < ground) camera_.target.y = ground;
+        }
+    }
+
     void updateUniformBuffer(std::uint32_t frame)
     {
         TerrainSettings& s = terrain_.settings();
+        clampCameraAboveGround();
         glm::vec3 sunDir = sunDirection();
         float sunWarmth = glm::smoothstep(0.0f, 0.55f, sunDir.y);
         float daylight = glm::smoothstep(-0.10f, 0.12f, sunDir.y); // 0 at night, 1 by day
@@ -1724,7 +2218,8 @@ private:
         fogColor = glm::mix(glm::vec3(0.045f, 0.060f, 0.085f), fogColor, daylight); // night fog goes dark blue
         SceneUniforms ubo{};
         ubo.view = camera_.view();
-        ubo.proj = glm::perspective(glm::radians(58.0f), static_cast<float>(swapchainExtent_.width) / static_cast<float>(swapchainExtent_.height), 0.1f, 650.0f);
+        float nearPlane = walkMode_ ? 0.012f : 0.1f;   // walking: 0.7 m so the ground underfoot is not clipped
+        ubo.proj = glm::perspective(glm::radians(58.0f), static_cast<float>(swapchainExtent_.width) / static_cast<float>(swapchainExtent_.height), nearPlane, 650.0f);
         ubo.proj[1][1] *= -1.0f;
         ubo.cameraPos = glm::vec4(camera_.position, 1.0f);
         ubo.sunDir = glm::vec4(sunDir, 0.0f);
@@ -1746,7 +2241,8 @@ private:
         ubo.lightning = (weatherEnabled_ && showLightning_) ? weather_.lightningLight() : glm::vec4(0.0f);
         bool anyCloud = weatherEnabled_ && weather_.ready() && weather_.viewMaxQc() > 2.0e-5f;
         ubo.shadowParams = glm::vec4(sunShadows_ ? 1.0f : 0.0f,
-                                     (cloudShadows_ && anyCloud) ? 1.0f : 0.0f, moonPhase_, 0.0f);
+                                     (cloudShadows_ && anyCloud) ? 1.0f : 0.0f, moonPhase_, cloudDetail_);
+        ubo.material = glm::vec4(texMacro_, texMid_, texNear_, static_cast<float>(kTerrainSize));
         void* data = nullptr;
         vkMapMemory(device_, uniformMemories_[frame], 0, sizeof(ubo), 0, &data);
         std::memcpy(data, &ubo, sizeof(ubo));
@@ -1756,11 +2252,17 @@ private:
     void updateErosionAnimation()
     {
         if (!erosionAnimating_) return;
-        terrain_.stepLiveDroplets(erosionSpeed_);
-        terrainDirty_ = true;
-        if (!terrain_.hasActiveDroplets()) {
+        // Feed droplets in batches so a frame never steps the whole run at once.
+        const int maxActive = 9000;
+        if (pendingDrops_ > 0) pendingDrops_ -= terrain_.spawnLiveDroplets(std::min(pendingDrops_, 2500), maxActive);
+        ++erosionFrame_;
+        bool rebuild = (erosionFrame_ % 3) == 0;
+        terrain_.stepLiveDroplets(erosionSpeed_, rebuild);
+        if (rebuild) terrainDirty_ = true;
+        if (!terrain_.hasActiveDroplets() && pendingDrops_ <= 0) {
             erosionAnimating_ = false;
             terrain_.finishLiveErosion();
+            terrainDirty_ = true;
         }
     }
 
@@ -1793,7 +2295,7 @@ private:
         ImGui::SetNextWindowPos(ImVec2(18, 318), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(330, 292), ImGuiCond_FirstUseEver);
         ImGui::Begin("Erosion");
-        ImGui::SliderInt("Drops", &terrain_.settings().erosionDrops, 1000, 45000);
+        ImGui::SliderInt("Drops", &terrain_.settings().erosionDrops, 5000, 400000);
         ImGui::SliderFloat("Radius", &terrain_.settings().erosionRadius, 1.0f, 5.0f, "%.1f");
         ImGui::SliderFloat("Inertia", &terrain_.settings().inertia, 0.0f, 0.92f, "%.2f");
         ImGui::SliderFloat("Capacity", &terrain_.settings().capacity, 1.0f, 10.0f, "%.1f");
@@ -1807,7 +2309,8 @@ private:
         if (ImGui::Button(erosionAnimating_ ? "Simulating" : "Start simulation")) {
             int drops = terrain_.settings().erosionDrops;
             terrain_.beginLiveErosion(drops);
-            terrain_.spawnLiveDroplets(drops, drops);
+            pendingDrops_ = drops;
+            erosionFrame_ = 0;
             erosionAnimating_ = true;
             terrainDirty_ = true;
         }
@@ -1825,6 +2328,13 @@ private:
         ImGui::Checkbox("Show sediment", &terrain_.settings().showSediment);
         ImGui::SliderFloat("Fog density", &terrain_.settings().fogDensity, 0.0f, 0.03f, "%.3f");
         ImGui::Checkbox("Wireframe", &wireframe_);
+        ImGui::Checkbox("Vegetation", &showVegetation_);
+        ImGui::SameLine();
+        ImGui::Text("%.1f ms/frame", frameMsAvg_);
+        ImGui::SeparatorText("Ground textures");
+        ImGui::SliderFloat("Large tile", &texMacro_, 3.0f, 30.0f, "%.1f units");
+        ImGui::SliderFloat("Mid tile", &texMid_, 0.4f, 4.0f, "%.2f units");
+        ImGui::SliderFloat("Near tile", &texNear_, 0.05f, 1.0f, "%.2f units");
 
         ImGui::SeparatorText("Lighting");
         ImGui::Checkbox("Sun shadows", &sunShadows_);
@@ -1850,7 +2360,7 @@ private:
         ImGui::SetNextWindowPos(ImVec2(365, 306), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(330, 185), ImGuiCond_FirstUseEver);
         ImGui::Begin("Camera");
-        ImGui::SliderFloat("Orbit distance", &camera_.distance, 16.0f, 260.0f, "%.0f");
+        ImGui::SliderFloat("Orbit distance", &camera_.distance, 0.6f, 260.0f, "%.1f");
         ImGui::SliderFloat("Pan speed", &camera_.panSpeed, 0.05f, 0.55f, "%.2f");
         ImGui::Text("Last input: %s", camera_.lastInput.c_str());
         if (ImGui::Button("Reset view")) {
@@ -1859,8 +2369,14 @@ private:
             camera_.pitch = -18.0f;
             camera_.distance = 132.0f;
         }
-        ImGui::TextWrapped("One-finger click-drag orbits. Two-finger vertical swipe zooms; horizontal swipe pans. Shift + right drag pans. WASD pans the target.");
-        camera_.updateFromOrbit();
+        ImGui::Checkbox("Walk mode (F)", &walkMode_);
+        if (walkMode_) {
+            ImGui::SliderFloat("Walk speed", &walkSpeedMps_, 1.5f, 120.0f, "%.0f m/s");
+            ImGui::TextWrapped("Walk: WASD moves, drag looks, Space/Ctrl fly up/down, Shift sprints, scroll changes speed. F returns to orbit.");
+        } else {
+            ImGui::TextWrapped("One-finger click-drag orbits. Two-finger vertical swipe zooms; horizontal swipe pans. Shift + right drag pans. WASD pans the target. F drops you onto the ground.");
+            camera_.updateFromOrbit();
+        }
         ImGui::End();
     }
 
@@ -2073,6 +2589,10 @@ private:
         ImGui::Begin("Weather");
         ImGui::Text("sim time: %.0f s   grid %dx%dx%d", weather_.simTime(), weather_.nx(), weather_.ny(), weather_.nz());
         ImGui::Text("boxes: %d", weather_.nx() * weather_.ny() * weather_.nz());
+        WeatherTimings wt = weather_.timings();
+        ImGui::Text("step %.1f ms  sub %d  snap %.1f ms", wt.stepMs, wt.substeps, wt.snapshotMs);
+        ImGui::Text("force %.1f  advect %.1f  micro %.1f", wt.forceMs, wt.advectMs, wt.microMs);
+        ImGui::Text("pressure %.1f  diffuse %.1f", wt.projectMs, wt.diffuseMs);
         const char* presets[] = {"Default", "Dry wind", "Orographic cloud", "Storm buildup", "Rain shadow", "Valley fog"};
         if (ImGui::Combo("Preset", &weatherPreset_, presets, IM_ARRAYSIZE(presets))) applyWeatherPreset(weatherPreset_);
         if (ImGui::Button(weatherRunning_ ? "Pause" : "Run")) weatherRunning_ = !weatherRunning_;
@@ -2144,6 +2664,7 @@ private:
             ImGui::SliderInt("March steps", &cloudSteps_, 12, 128);
             ImGui::SliderFloat("Sun absorption", &cloudSunAbsorb_, 0.1f, 4.0f, "%.2f");
             ImGui::SliderFloat("Coverage trim", &cloudCoverage_, 0.0f, 0.5f, "%.3f");
+            ImGui::SliderFloat("Subgrid detail", &cloudDetail_, 0.0f, 1.0f, "%.2f");
         }
 
         const char* fields[] = {"Temperature", "Theta pert", "Vertical wind", "Wind speed", "Vapor", "Rel humidity", "Cloud", "Rain", "Vorticity"};
@@ -2454,7 +2975,8 @@ private:
         vkCmdBindIndexBuffer(commandBuffer, indexBuffer_, 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
         vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(terrain_.indices().size()), 1, 0, 0, 0);
-        if (sliceVertexCount_[currentFrame_] > 0) {
+        drawVegetation(commandBuffer);
+        if (sliceVertexCount_[currentFrame_] > 0 && !hideUi_) {
             vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, slicePipeline_);
             vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
             VkDeviceSize sOff = 0;
@@ -2477,6 +2999,60 @@ private:
         checkVk(vkEndCommandBuffer(commandBuffer), "Failed to record command buffer");
     }
 
+    // Copy a presented-layout swapchain image to a host buffer and write a binary PPM.
+    void saveSwapchainImage(std::uint32_t imageIndex, const std::string& path)
+    {
+        VkDeviceSize bytes = static_cast<VkDeviceSize>(swapchainExtent_.width) * swapchainExtent_.height * 4;
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, buf, mem);
+        VkCommandBuffer cmd = beginSingleTimeCommands();
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = swapchainImages_[imageIndex];
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {swapchainExtent_.width, swapchainExtent_.height, 1};
+        vkCmdCopyImageToBuffer(cmd, swapchainImages_[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        endSingleTimeCommands(cmd);
+        void* mapped = nullptr;
+        vkMapMemory(device_, mem, 0, bytes, 0, &mapped);
+        const auto* px = static_cast<const unsigned char*>(mapped);
+        std::ofstream out(path, std::ios::binary);
+        out << "P6\n" << swapchainExtent_.width << " " << swapchainExtent_.height << "\n255\n";
+        std::vector<unsigned char> row(static_cast<std::size_t>(swapchainExtent_.width) * 3);
+        bool bgr = (swapchainFormat_ == VK_FORMAT_B8G8R8A8_SRGB || swapchainFormat_ == VK_FORMAT_B8G8R8A8_UNORM);
+        for (std::uint32_t y = 0; y < swapchainExtent_.height; ++y) {
+            for (std::uint32_t x = 0; x < swapchainExtent_.width; ++x) {
+                const unsigned char* p = px + (static_cast<std::size_t>(y) * swapchainExtent_.width + x) * 4;
+                row[x * 3 + 0] = bgr ? p[2] : p[0];
+                row[x * 3 + 1] = p[1];
+                row[x * 3 + 2] = bgr ? p[0] : p[2];
+            }
+            out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
+        }
+        out.close();
+        vkUnmapMemory(device_, mem);
+        vkDestroyBuffer(device_, buf, nullptr);
+        vkFreeMemory(device_, mem, nullptr);
+        std::cout << "Saved screenshot " << path << " cam pos " << camera_.position.x << "," << camera_.position.y << "," << camera_.position.z
+                  << " target " << camera_.target.x << "," << camera_.target.y << "," << camera_.target.z
+                  << " yaw " << camera_.yaw << " pitch " << camera_.pitch << " dist " << camera_.distance
+                  << " frame " << frameMsAvg_ << " ms\n";
+    }
+
     void drawFrame()
     {
         vkWaitForFences(device_, 1, &inFlight_[currentFrame_], VK_TRUE, UINT64_MAX);
@@ -2490,8 +3066,15 @@ private:
             checkVk(acquire, "Failed to acquire swapchain image");
         }
         vkResetFences(device_, 1, &inFlight_[currentFrame_]);
-        if (terrainDirty_) { uploadTerrain(); syncWeatherTerrain(); uploadCloudHeightmap(); }
+        if (terrainDirty_) {
+            uploadTerrain();
+            if (!erosionAnimating_) {
+                syncWeatherTerrain(); uploadCloudHeightmap(); refreshEcoTexture();
+                veg_.place(terrain_, terrain_.settings().seed);
+            }
+        }
         updateUniformBuffer(static_cast<std::uint32_t>(currentFrame_));
+        updateVegetation(static_cast<std::uint32_t>(currentFrame_));
         updateCloudData(static_cast<std::uint32_t>(currentFrame_));
         buildSliceGeometry(static_cast<std::uint32_t>(currentFrame_));
         vkResetCommandBuffer(commandBuffers_[currentFrame_], 0);
@@ -2508,6 +3091,12 @@ private:
         submit.signalSemaphoreCount = 1;
         submit.pSignalSemaphores = signalSemaphores;
         checkVk(vkQueueSubmit(graphicsQueue_, 1, &submit, inFlight_[currentFrame_]), "Failed to submit frame");
+        if (!shotPath_.empty() && ++frameCounter_ >= shotFrame_) {
+            vkQueueWaitIdle(graphicsQueue_);
+            saveSwapchainImage(imageIndex, shotPath_);
+            shotPath_.clear();
+            glfwSetWindowShouldClose(window_, GLFW_TRUE);
+        }
         VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         present.waitSemaphoreCount = 1;
         present.pWaitSemaphores = signalSemaphores;
@@ -2530,6 +3119,7 @@ private:
             auto now = std::chrono::high_resolution_clock::now();
             float dt = std::chrono::duration<float>(now - previous).count();
             previous = now;
+            frameMsAvg_ = (frameMsAvg_ <= 0.0f) ? dt * 1000.0f : glm::mix(frameMsAvg_, dt * 1000.0f, 0.1f);
             glfwPollEvents();
             ImGui_ImplVulkan_NewFrame();
             ImGui_ImplGlfw_NewFrame();
@@ -2537,10 +3127,14 @@ private:
             processInput(dt);
             updateErosionAnimation();
             updateWeather(dt);
-            drawControls();
-            drawWeatherControls();
-            drawFlowOverlay();
-            drawWeatherOverlay();
+            if (!hideUi_) {
+                drawControls();
+                drawWeatherControls();
+                drawFlowOverlay();
+                drawWeatherOverlay();
+            } else if (!walkMode_) {
+                camera_.updateFromOrbit();
+            }
             ImGui::Render();
             drawFrame();
         }
@@ -2580,6 +3174,25 @@ private:
         vkFreeMemory(device_, indexMemory_, nullptr);
         vkDestroyBuffer(device_, vertexBuffer_, nullptr);
         vkFreeMemory(device_, vertexMemory_, nullptr);
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            if (vegInstanceMapped_[i]) vkUnmapMemory(device_, vegInstanceMemories_[i]);
+            if (vegInstanceBuffers_[i]) vkDestroyBuffer(device_, vegInstanceBuffers_[i], nullptr);
+            if (vegInstanceMemories_[i]) vkFreeMemory(device_, vegInstanceMemories_[i], nullptr);
+        }
+        if (vegVertexBuffer_) vkDestroyBuffer(device_, vegVertexBuffer_, nullptr);
+        if (vegVertexMemory_) vkFreeMemory(device_, vegVertexMemory_, nullptr);
+        if (vegIndexBuffer_) vkDestroyBuffer(device_, vegIndexBuffer_, nullptr);
+        if (vegIndexMemory_) vkFreeMemory(device_, vegIndexMemory_, nullptr);
+        if (vegPipeline_) vkDestroyPipeline(device_, vegPipeline_, nullptr);
+        if (matSampler_) vkDestroySampler(device_, matSampler_, nullptr);
+        if (matAlbedoView_) vkDestroyImageView(device_, matAlbedoView_, nullptr);
+        if (matAlbedoImage_) vkDestroyImage(device_, matAlbedoImage_, nullptr);
+        if (matAlbedoMemory_) vkFreeMemory(device_, matAlbedoMemory_, nullptr);
+        if (matNormalView_) vkDestroyImageView(device_, matNormalView_, nullptr);
+        if (matNormalImage_) vkDestroyImage(device_, matNormalImage_, nullptr);
+        if (matNormalMemory_) vkFreeMemory(device_, matNormalMemory_, nullptr);
+        destroyEcoTexture();
+        if (ecoSampler_) vkDestroySampler(device_, ecoSampler_, nullptr);
         vkDestroySampler(device_, skyboxSampler_, nullptr);
         vkDestroyImageView(device_, skyboxView_, nullptr);
         vkDestroyImage(device_, skyboxImage_, nullptr);

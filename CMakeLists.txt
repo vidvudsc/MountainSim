@@ -53,6 +53,8 @@ set(VULKAN_SHADERS
   ${SHADER_SOURCE_DIR}/slice.frag
   ${SHADER_SOURCE_DIR}/terrain.vert
   ${SHADER_SOURCE_DIR}/terrain.frag
+  ${SHADER_SOURCE_DIR}/veg.vert
+  ${SHADER_SOURCE_DIR}/veg.frag
 )
 
 set(SPIRV_SHADERS)

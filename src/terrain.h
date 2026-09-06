@@ -10,7 +10,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <queue>
 #include <random>
+#include <utility>
 #include <vector>
 
 struct TerrainSettings {
@@ -31,8 +33,8 @@ struct TerrainSettings {
     float sunElevation = 34.0f;
     bool showWater = true;
     bool showSediment = true;
-    int erosionDrops = 18000;
-    float erosionRadius = 1.9f;
+    int erosionDrops = 120000;
+    float erosionRadius = 1.9f * kGridScale;
     float inertia = 0.18f;
     float capacity = 3.6f;
     float minCapacity = 0.02f;
@@ -96,11 +98,11 @@ public:
 
                 float base = fbm(centered + glm::vec2(4.2f, -8.7f), settings.octaves, settings.frequency, settings.persistence);
                 float detail = fbm(centered + glm::vec2(-11.4f, 5.9f), std::max(3, settings.octaves - 2), settings.frequency * 3.4f, settings.persistence * 0.82f);
-                float micro = fbm(centered + glm::vec2(19.1f, 13.3f), 3, settings.frequency * 11.0f, settings.persistence * 0.55f);
+                float micro = fbm(centered + glm::vec2(19.1f, 13.3f), 5, settings.frequency * 11.0f, settings.persistence * 0.60f);
                 float massif = fbm(centered + glm::vec2(31.0f, -17.0f), 3, 0.78f, 0.58f);
                 float islandMask = smoothstep01(1.13f - glm::length(centered * glm::vec2(0.92f, 1.05f)) * 0.52f);
                 float mountainMask = smoothstep01((massif - 0.30f) / 0.48f);
-                float h = base * 0.72f + detail * 0.22f + micro * 0.06f;
+                float h = base * 0.72f + detail * 0.22f + micro * 0.075f;
                 h = std::pow(glm::clamp(h, 0.0f, 1.0f), settings.peakSharpness);
                 h *= glm::mix(0.42f, 1.18f, mountainMask) * islandMask;
                 heights_[idx(x, z)] = h;
@@ -112,7 +114,7 @@ public:
             h = (h - minHeight) / std::max(maxHeight - minHeight, 0.001f);
             h = h * settings.heightScale;
         }
-        smoothHeightmap(1, 0.08f);
+        smoothHeightmap(static_cast<int>(std::round(kGridScale)), 0.08f);
         rebuildSurfaceState();
         rebuildVertices();
     }
@@ -149,7 +151,7 @@ public:
         return spawned;
     }
 
-    void stepLiveDroplets(float speedScale)
+    void stepLiveDroplets(float speedScale, bool rebuild = true)
     {
         if (liveDroplets_.empty()) {
             particlePositions_.clear();
@@ -167,7 +169,7 @@ public:
         particlePositions_.reserve(liveDroplets_.size());
         for (const Droplet& droplet : liveDroplets_) particlePositions_.push_back(terrainPoint(droplet.x, droplet.z));
         hasErosionFlow_ = hasErosionFlow_ || !particlePositions_.empty();
-        rebuildVertices();
+        if (rebuild) rebuildVertices();
     }
 
     void finishLiveErosion()
@@ -192,6 +194,7 @@ public:
     void finishErosionPass()
     {
         updateHydroDisplay();
+        fillSmallPits(4);
         smoothHeightmap(1, 0.028f);
         rebuildSurfaceState();
         rebuildVertices();
@@ -353,6 +356,7 @@ private:
             iceMass_.assign(heights_.size(), 0.0f);
         }
 
+        computeHydrology();
         float maxH = std::max(maxSurfaceHeight(), 0.001f);
         for (int z = 0; z < kTerrainSize; ++z) {
             for (int x = 0; x < kTerrainSize; ++x) {
@@ -363,7 +367,10 @@ private:
                 int zu = std::min(kTerrainSize - 1, z + 1);
                 float sx = heights_[idx(xr, z)] - heights_[idx(xl, z)];
                 float sz = heights_[idx(x, zu)] - heights_[idx(x, zd)];
-                float slope = glm::clamp(glm::length(glm::vec2(sx, sz)) * 0.45f, 0.0f, 1.0f);
+                // Rise per world unit so thresholds do not depend on grid resolution;
+                // 0.77 reproduces the original 193-grid tuning.
+                float stepWorld = kTerrainWorldSize / static_cast<float>(kTerrainSize - 1);
+                float slope = glm::clamp(glm::length(glm::vec2(sx, sz)) / (2.0f * stepWorld) * 0.77f, 0.0f, 1.0f);
                 float height01 = glm::clamp(heights_[index] / maxH, 0.0f, 1.0f);
                 float sediment = (index < static_cast<int>(displaySediment_.size())) ? displaySediment_[index] : 0.0f;
                 float water = (index < static_cast<int>(displayWater_.size())) ? displayWater_[index] : 0.0f;
@@ -391,7 +398,250 @@ private:
                 surfaceTempC_[index] = settings_.surfaceTempC - height01 * 16.0f - snowMass_[index] * 7.0f - iceMass_[index] * 4.0f + materialOffset;
             }
         }
+        rebuildEcology();
     }
+
+    // ---- ecology maps: drainage, curvature, forest density, sky view -------------------
+    // Feed the material shader and vegetation placement so colour and objects agree.
+    void rebuildEcology()
+    {
+        const int N = kTerrainSize;
+        const int count = N * N;
+        if (flowAccum_.size() != static_cast<std::size_t>(count)) computeHydrology();
+        curvature_.assign(count, 0.5f);
+        forest_.assign(count, 0.0f);
+        skyView_.assign(count, 1.0f);
+        float maxH = std::max(maxSurfaceHeight(), 0.001f);
+        float stepWorld = kTerrainWorldSize / static_cast<float>(N - 1);
+
+        // Curvature: Laplacian of a blurred height field, robustly normalised.
+        {
+            std::vector<float> sm = heights_;
+            blurField(sm, 5);
+            double sum2 = 0.0;
+            for (int z = 0; z < N; ++z) for (int x = 0; x < N; ++x) {
+                int xl = std::max(0, x - 1), xr = std::min(N - 1, x + 1);
+                int zd = std::max(0, z - 1), zu = std::min(N - 1, z + 1);
+                float lap = sm[z * N + xl] + sm[z * N + xr] + sm[zd * N + x] + sm[zu * N + x] - 4.0f * sm[z * N + x];
+                curvature_[z * N + x] = lap;
+                sum2 += double(lap) * lap;
+            }
+            float sd = static_cast<float>(std::sqrt(sum2 / count)) + 1e-6f;
+            for (float& c : curvature_) c = glm::clamp(0.5f + 0.5f * (c / (2.5f * sd)), 0.0f, 1.0f);
+        }
+        // Sky view factor on a coarse grid, upsampled.
+        {
+            const int ds = 4, dirs = 16, maxSteps = 40;
+            int cw = N / ds;
+            std::vector<float> coarse(static_cast<std::size_t>(cw) * cw);
+            for (int cz = 0; cz < cw; ++cz) for (int cx = 0; cx < cw; ++cx) {
+                float fx = cx * float(ds), fz = cz * float(ds);
+                float h0 = sampleHeight(fx, fz);
+                float sinSum = 0.0f;
+                for (int d = 0; d < dirs; ++d) {
+                    float ang = d / float(dirs) * 6.2831853f;
+                    float dx = std::cos(ang), dz = std::sin(ang);
+                    float maxTan = 0.0f;
+                    for (int st = 1; st <= maxSteps; ++st) {
+                        float sx = fx + dx * st * ds, sz = fz + dz * st * ds;
+                        if (sx < 0 || sz < 0 || sx > N - 1 || sz > N - 1) break;
+                        float t = (sampleHeight(sx, sz) - h0) / (st * ds * stepWorld);
+                        maxTan = std::max(maxTan, t);
+                    }
+                    sinSum += std::sin(std::atan(maxTan));
+                }
+                coarse[cz * cw + cx] = glm::clamp(1.0f - sinSum / dirs, 0.0f, 1.0f);
+            }
+            for (int z = 0; z < N; ++z) for (int x = 0; x < N; ++x) {
+                float gx = std::min(x / float(ds), cw - 1.001f), gz = std::min(z / float(ds), cw - 1.001f);
+                int x0 = int(gx), z0 = int(gz);
+                float tx = gx - x0, tz = gz - z0;
+                float a = coarse[z0 * cw + x0], b = coarse[z0 * cw + x0 + 1];
+                float c = coarse[(z0 + 1) * cw + x0], d = coarse[(z0 + 1) * cw + x0 + 1];
+                skyView_[z * N + x] = glm::mix(glm::mix(a, b, tx), glm::mix(c, d, tx), tz);
+            }
+        }
+        // Forest density: below a treeline, gentler ground, clumped, following drainage.
+        {
+            Perlin2D perlin(settings_.seed + 4001);
+            auto fbm2 = [&](float x, float z, int oct, float freq) {
+                float amp = 1.0f, sum = 0.0f, norm = 0.0f;
+                for (int o = 0; o < oct; ++o) { sum += perlin.noise(x * freq, z * freq) * amp; norm += amp; amp *= 0.5f; freq *= 2.03f; }
+                return sum / norm * 0.5f + 0.5f;
+            };
+            for (int z = 0; z < N; ++z) for (int x = 0; x < N; ++x) {
+                int i = z * N + x;
+                float wx = (x / float(N - 1) - 0.5f) * kTerrainWorldSize;
+                float wz = (z / float(N - 1) - 0.5f) * kTerrainWorldSize;
+                float hN = heights_[i] / maxH;
+                int xl = std::max(0, x - 1), xr = std::min(N - 1, x + 1);
+                int zd = std::max(0, z - 1), zu = std::min(N - 1, z + 1);
+                float gx = (heights_[z * N + xr] - heights_[z * N + xl]) / (2.0f * stepWorld);
+                float gz = (heights_[zu * N + x] - heights_[zd * N + x]) / (2.0f * stepWorld);
+                float ny = 1.0f / std::sqrt(gx * gx + gz * gz + 1.0f);
+                float slope = 1.0f - ny;
+                float macro2 = fbm2(wx * 0.07f - 31.0f, wz * 0.07f + 17.0f, 4, 1.0f);
+                float clump = fbm2(wx * 0.17f - 4.0f, wz * 0.17f + 27.0f, 3, 1.0f);
+                float drainage = smoothstep01((flowAccum_[i] - 0.35f) / 0.40f);
+                float convex = glm::clamp((0.5f - curvature_[i]) * 2.0f, 0.0f, 1.0f);
+                float rock = smoothstep01((slope + convex * 0.08f - 0.16f) / 0.16f);
+                float treeLine = 0.48f + (macro2 - 0.5f) * 0.12f;
+                float f = 1.0f - smoothstep01((hN - (treeLine - 0.10f)) / 0.13f);
+                f *= 1.0f - smoothstep01((slope - 0.16f) / 0.14f);
+                f *= smoothstep01((clump * 0.70f + drainage * 0.45f + 0.28f - 0.30f) / 0.30f);
+                f *= (1.0f - rock);
+                // No forest in lakes or on stream beds; a bare strip follows the channels.
+                float water = displayWater_.empty() ? 0.0f : displayWater_[i];
+                f *= 1.0f - smoothstep01((water - 0.30f) / 0.30f);
+                f *= 1.0f - smoothstep01((flowAccum_[i] - 0.62f) / 0.18f) * 0.85f;
+                forest_[i] = glm::clamp(f, 0.0f, 1.0f);
+            }
+            blurField(forest_, 1);
+        }
+        ecoPixels_.resize(static_cast<std::size_t>(count) * 4);
+        for (int i = 0; i < count; ++i) {
+            ecoPixels_[i * 4 + 0] = static_cast<std::uint8_t>(std::lround(flowAccum_[i] * 255.0f));
+            ecoPixels_[i * 4 + 1] = static_cast<std::uint8_t>(std::lround(curvature_[i] * 255.0f));
+            ecoPixels_[i * 4 + 2] = static_cast<std::uint8_t>(std::lround(forest_[i] * 255.0f));
+            ecoPixels_[i * 4 + 3] = static_cast<std::uint8_t>(std::lround(skyView_[i] * 255.0f));
+        }
+    }
+
+    // Remove 1-cell pits left by droplets: raise any cell below all eight neighbours to the
+    // lowest neighbour. Big depressions survive and become lakes; the speckle does not.
+    void fillSmallPits(int passes)
+    {
+        const int N = kTerrainSize;
+        for (int p = 0; p < passes; ++p) {
+            for (int z = 1; z < N - 1; ++z) {
+                for (int x = 1; x < N - 1; ++x) {
+                    float h = heights_[idx(x, z)];
+                    float lowest = 1e9f;
+                    for (int dz = -1; dz <= 1; ++dz) for (int dx = -1; dx <= 1; ++dx) {
+                        if (!dx && !dz) continue;
+                        lowest = std::min(lowest, heights_[idx(x + dx, z + dz)]);
+                    }
+                    if (h < lowest) heights_[idx(x, z)] = lowest + 0.0005f;
+                }
+            }
+        }
+    }
+
+    // Drainage and standing water from the height field itself:
+    //  - flow accumulation by multiple-flow-direction routing (rivers),
+    //  - depression filling (priority flood) for lake levels,
+    // then displayWater_ becomes lakes + channels instead of wherever droplets happened to die.
+    void computeHydrology()
+    {
+        const int N = kTerrainSize;
+        const int count = N * N;
+        flowAccum_.assign(count, 0.0f);
+        lakeDepth_.assign(count, 0.0f);
+
+        // Depression fill: flood from the border with a min-heap; water level = max(h, spill).
+        {
+            std::vector<float> filled(count, 1e9f);
+            std::vector<char> done(count, 0);
+            using Item = std::pair<float, int>;
+            std::priority_queue<Item, std::vector<Item>, std::greater<Item>> pq;
+            for (int x = 0; x < N; ++x) {
+                for (int z : {0, N - 1}) { int i = z * N + x; filled[i] = heights_[i]; done[i] = 1; pq.push({filled[i], i}); }
+            }
+            for (int z = 1; z < N - 1; ++z) {
+                for (int x : {0, N - 1}) { int i = z * N + x; filled[i] = heights_[i]; done[i] = 1; pq.push({filled[i], i}); }
+            }
+            while (!pq.empty()) {
+                auto [level, i] = pq.top(); pq.pop();
+                int x = i % N, z = i / N;
+                for (int dz = -1; dz <= 1; ++dz) for (int dx = -1; dx <= 1; ++dx) {
+                    if (!dx && !dz) continue;
+                    int sx = x + dx, sz = z + dz;
+                    if (sx < 0 || sz < 0 || sx >= N || sz >= N) continue;
+                    int j = sz * N + sx;
+                    if (done[j]) continue;
+                    done[j] = 1;
+                    filled[j] = std::max(heights_[j], level);
+                    pq.push({filled[j], j});
+                }
+            }
+            for (int i = 0; i < count; ++i) lakeDepth_[i] = std::max(0.0f, filled[i] - heights_[i]);
+            // Route flow over the filled surface so rivers cross lakes instead of dying in them.
+            std::vector<int> order(count);
+            for (int i = 0; i < count; ++i) order[i] = i;
+            std::sort(order.begin(), order.end(), [&](int a, int b) { return filled[a] > filled[b]; });
+            std::vector<float> acc(count, 1.0f);
+            for (int i : order) {
+                int x = i % N, z = i / N;
+                float wsum = 0.0f; float w[8]; int tgt[8]; int n = 0;
+                for (int dz = -1; dz <= 1; ++dz) for (int dx = -1; dx <= 1; ++dx) {
+                    if (!dx && !dz) continue;
+                    int sx = x + dx, sz = z + dz;
+                    if (sx < 0 || sz < 0 || sx >= N || sz >= N) continue;
+                    int j = sz * N + sx;
+                    float drop = filled[i] - filled[j];
+                    if (drop <= 0.0f) {
+                        // flat lake surface: let water spread evenly toward lower-or-equal cells
+                        if (drop < 0.0f || lakeDepth_[i] <= 0.0f) continue;
+                        drop = 1e-4f;
+                    }
+                    float d = (dx && dz) ? 1.41421356f : 1.0f;
+                    float wgt = std::pow(drop / d, 1.1f);
+                    w[n] = wgt; tgt[n] = j; wsum += wgt; ++n;
+                }
+                if (wsum <= 0.0f) continue;
+                for (int t = 0; t < n; ++t) acc[tgt[t]] += acc[i] * (w[t] / wsum);
+            }
+            float maxAcc = 1.0f;
+            for (float a : acc) maxAcc = std::max(maxAcc, a);
+            float logMax = std::log(1.0f + maxAcc);
+            for (int i = 0; i < count; ++i) flowAccum_[i] = glm::clamp(std::log(1.0f + acc[i]) / logMax, 0.0f, 1.0f);
+            blurField(flowAccum_, 1);
+        }
+
+        // Water display stays the droplet-based wash (the look the user prefers); channels from
+        // flow accumulation only reinforce it a little so rivers read as continuous lines.
+        if (displayWater_.size() != static_cast<std::size_t>(count)) displayWater_.assign(count, 0.0f);
+        for (int i = 0; i < count; ++i) {
+            float stream = smoothstep01((flowAccum_[i] - 0.70f) / 0.22f);
+            displayWater_[i] = glm::clamp(std::max(displayWater_[i], stream * 0.55f), 0.0f, 1.0f);
+        }
+    }
+
+    const std::vector<float>& lakeDepth() const { return lakeDepth_; }
+
+    void blurField(std::vector<float>& f, int passes)
+    {
+        const int N = kTerrainSize;
+        std::vector<float> tmp(f.size());
+        for (int p = 0; p < passes; ++p) {
+            for (int z = 0; z < N; ++z) for (int x = 0; x < N; ++x) {
+                float sum = 0.0f; int n = 0;
+                for (int dz = -1; dz <= 1; ++dz) for (int dx = -1; dx <= 1; ++dx) {
+                    int sx = x + dx, sz = z + dz;
+                    if (sx < 0 || sz < 0 || sx >= N || sz >= N) continue;
+                    sum += f[sz * N + sx]; ++n;
+                }
+                tmp[z * N + x] = sum / n;
+            }
+            f.swap(tmp);
+        }
+    }
+
+public:
+    const std::vector<std::uint8_t>& ecoPixels() const { return ecoPixels_; }
+    const std::vector<float>& forestMap() const { return forest_; }
+    const std::vector<float>& heights() const { return heights_; }
+    float slopeAt(int x, int z) const
+    {
+        const int N = kTerrainSize;
+        float stepWorld = kTerrainWorldSize / static_cast<float>(N - 1);
+        int xl = std::max(0, x - 1), xr = std::min(N - 1, x + 1);
+        int zd = std::max(0, z - 1), zu = std::min(N - 1, z + 1);
+        float gx = (heights_[z * N + xr] - heights_[z * N + xl]) / (2.0f * stepWorld);
+        float gz = (heights_[zu * N + x] - heights_[zd * N + x]) / (2.0f * stepWorld);
+        return 1.0f - 1.0f / std::sqrt(gx * gx + gz * gz + 1.0f);
+    }
+private:
 
     void appendSurfaceIndices()
     {
@@ -513,11 +763,11 @@ private:
 
         addHydro(droplet.x, droplet.z, droplet.water * 0.028f * stepScale, droplet.sediment * 0.017f * stepScale);
         droplet.speed = std::sqrt(std::max(0.0f, droplet.speed * droplet.speed + deltaHeight * settings_.gravity * stepScale));
-        droplet.water *= std::pow(1.0f - settings_.evaporation, stepScale);
+        droplet.water *= std::pow(1.0f - settings_.evaporation, stepScale / kGridScale);
         droplet.x = nextX;
         droplet.z = nextZ;
         droplet.age += stepScale;
-        if (droplet.water < 0.02f || droplet.age >= 46.0f) droplet.alive = false;
+        if (droplet.water < 0.02f || droplet.age >= 46.0f * kGridScale) droplet.alive = false;
     }
 
     float hydroPercentile(const std::vector<float>& values, float p) const
@@ -568,7 +818,7 @@ private:
     void rebuildVertices()
     {
         float step = kTerrainWorldSize / static_cast<float>(kTerrainSize - 1);
-        updateHydroDisplay();
+        if (!liveDroplets_.empty() || displayWater_.size() != heights_.size()) updateHydroDisplay();
         vertices_.assign(kTerrainSize * kTerrainSize, Vertex{});
         indices_.clear();
         indices_.reserve((kTerrainSize - 1) * (kTerrainSize - 1) * 12);
@@ -680,6 +930,12 @@ private:
     std::vector<float> wetness_;
     std::vector<float> snowMass_;
     std::vector<float> iceMass_;
+    std::vector<float> flowAccum_;
+    std::vector<float> lakeDepth_;
+    std::vector<float> curvature_;
+    std::vector<float> forest_;
+    std::vector<float> skyView_;
+    std::vector<std::uint8_t> ecoPixels_;
     std::vector<Droplet> liveDroplets_;
     std::vector<glm::vec3> particlePositions_;
     bool hasErosionFlow_ = false;

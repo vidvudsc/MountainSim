@@ -23,11 +23,17 @@ layout(set = 0, binding = 0) uniform SceneUniforms {
     vec4 cloudParams;
     vec4 lightning;    // xyz flash world pos, w intensity
     vec4 shadowParams; // x sun-shadows on, y cloud-shadow strength
+    vec4 material;     // x macro tile, y mid tile, z near tile (world units), w terrain grid res
 } u;
 
 // Shared with the cloud pass: cloud water volume + terrain height, for shadow marches.
 layout(set = 0, binding = 2) uniform sampler3D cloudTex;
 layout(set = 0, binding = 3) uniform sampler2D heightTex;
+// Photo materials (Poly Haven CC0): layers rock, scree, grass, forest, snow, marsh.
+layout(set = 0, binding = 4) uniform sampler2DArray matAlbedo;
+layout(set = 0, binding = 5) uniform sampler2DArray matNormal;
+// Ecology map: r flow accumulation, g curvature (0.5 flat), b forest density, a sky view.
+layout(set = 0, binding = 6) uniform sampler2D ecoTex;
 
 layout(location = 0) out vec4 outColor;
 
@@ -63,6 +69,81 @@ float fbm(vec2 p)
         amp *= 0.5;
     }
     return sum;
+}
+
+// ---- textured materials ------------------------------------------------------------
+float gNearW = 0.0;
+float gMidW = 0.0;
+
+// Two-tap stochastic anti-tiling (Quilez); v is a slow-varying 0..1 field.
+vec4 sampleNT(sampler2DArray t, vec2 uv, float layer, float v)
+{
+    float l = v * 8.0;
+    float f = fract(l);
+    float ia = floor(l);
+    float ib = ia + 1.0;
+    vec2 offa = sin(vec2(3.0, 7.0) * ia);
+    vec2 offb = sin(vec2(3.0, 7.0) * ib);
+    vec2 dx = dFdx(uv), dy = dFdy(uv);
+    vec4 ca = textureGrad(t, vec3(uv + offa, layer), dx, dy);
+    vec4 cb = textureGrad(t, vec3(uv + offb, layer), dx, dy);
+    vec3 dd = ca.rgb - cb.rgb;
+    return mix(ca, cb, smoothstep(0.2, 0.8, f - 0.1 * (dd.x + dd.y + dd.z)));
+}
+
+// One planar projection. Budget: anti-tiled macro albedo (2 taps), single detail albedo,
+// single macro normal; mid and near tiles only within their camera ranges.
+vec3 planar(float layer, vec2 uv, float v, out vec2 tn)
+{
+    vec2 uvM = uv / u.material.x;
+    vec2 uvD = uv / (u.material.x * 0.25);
+    vec3 cM = sampleNT(matAlbedo, uvM, layer, v).rgb;
+    vec3 cD = texture(matAlbedo, vec3(uvD + sin(vec2(3.0, 7.0) * floor(v * 8.0)), layer)).rgb;
+    vec3 nM = texture(matNormal, vec3(uvM, layer)).rgb * 2.0 - 1.0;
+    tn = nM.xy * 0.85;
+    vec3 c = mix(cM, cD, 0.25);
+    if (gMidW > 0.01) {
+        vec2 uvMid = uv / u.material.y;
+        vec3 cMid = sampleNT(matAlbedo, uvMid, layer, v * 3.1 + 0.83).rgb;
+        vec3 nMid = texture(matNormal, vec3(uvMid, layer)).rgb * 2.0 - 1.0;
+        c = mix(c, c * (cMid / max(vec3(0.30), vec3(dot(cMid, vec3(0.33))))), 0.7 * gMidW);
+        tn += nMid.xy * 0.5 * gMidW;
+    }
+    if (gNearW > 0.01) {
+        vec2 uvN = uv / u.material.z;
+        vec3 cN = sampleNT(matAlbedo, uvN, layer, v * 2.3 + 0.57).rgb;
+        vec3 nN = texture(matNormal, vec3(uvN, layer)).rgb * 2.0 - 1.0;
+        c = mix(c, c * (cN / max(vec3(0.30), vec3(dot(cN, vec3(0.33))))), 0.85 * gNearW);
+        tn += nN.xy * 0.8 * gNearW;
+    }
+    return c;
+}
+
+// Triplanar: top projection on gentle ground, side projections on steep faces so
+// textures stop smearing into vertical streaks.
+vec3 material(float layer, vec3 p, vec3 gN, float v, out vec2 tn)
+{
+    vec3 w = pow(abs(gN), vec3(6.0));
+    w /= (w.x + w.y + w.z);
+    vec3 col = vec3(0.0);
+    vec2 tAcc = vec2(0.0);
+    // Drop side projections under 12% so gentle ground pays for one projection only.
+    if (w.x < 0.12) w.x = 0.0;
+    if (w.z < 0.12) w.z = 0.0;
+    w /= max(w.x + w.y + w.z, 0.0001);
+    if (w.y > 0.0) { vec2 t; col += planar(layer, p.xz, v, t) * w.y; tAcc += t * w.y; }
+    if (w.x > 0.0) { vec2 t; col += planar(layer, vec2(p.z, p.y), v + 0.13, t) * w.x; tAcc += vec2(t.x, 0.0) * w.x * 0.5; }
+    if (w.z > 0.0) { vec2 t; col += planar(layer, vec2(p.x, p.y), v + 0.27, t) * w.z; tAcc += vec2(0.0, t.x) * w.z * 0.5; }
+    tn = tAcc;
+    return col;
+}
+
+vec4 ecoAt(vec2 xz)
+{
+    float R = u.material.w;
+    vec2 rel = clamp((xz + WS * 0.5) / WS, 0.0, 1.0);
+    vec2 tc = (rel * (R - 1.0) + 0.5) / R;
+    return texture(ecoTex, tc);
 }
 
 float terrainH(vec2 xz)
@@ -141,39 +222,100 @@ void main()
     vec3 halfDir = normalize(lightDir + viewDir);
 
     float height01 = clamp(vHeight / heightScale, 0.0, 1.0);
-    float slope = clamp(1.0 - n.y, 0.0, 1.0);
+    vec3 gN = n;
+    float slope = clamp(1.0 - gN.y, 0.0, 1.0);
     vec2 p = vWorldPos.xz;
+    float camDist = length(u.cameraPos.xyz - vWorldPos);
+    gNearW = 1.0 - smoothstep(4.0, 16.0, camDist);
+    gMidW = 1.0 - smoothstep(18.0, 70.0, camDist);
+
     float broad = fbm(p * 0.055);
     float medium = fbm(p * 0.23);
     float fine = fbm(p * 1.65);
-    float scratch = abs(noise(p * vec2(0.75, 2.8)) - 0.5) * 2.0;
-    float detail = broad * 0.44 + medium * 0.36 + fine * 0.20;
+    float ntVar = fbm(p * 0.09);
 
-    vec3 grass = mix(vec3(0.055, 0.19, 0.065), vec3(0.29, 0.43, 0.13), detail);
-    grass = mix(grass, vec3(0.15, 0.28, 0.09), smoothstep(0.58, 0.9, fine) * 0.35);
-    vec3 alpine = mix(vec3(0.30, 0.36, 0.25), vec3(0.47, 0.49, 0.35), medium);
-    vec3 rock = mix(vec3(0.24, 0.25, 0.25), vec3(0.56, 0.58, 0.57), medium);
-    rock = mix(rock, vec3(0.15, 0.155, 0.16), smoothstep(0.62, 0.96, scratch) * 0.38);
-    vec3 cliff = mix(vec3(0.19, 0.205, 0.215), vec3(0.48, 0.50, 0.51), scratch * 0.72 + fine * 0.28);
-    vec3 snow = mix(vec3(0.78, 0.88, 0.94), vec3(1.0, 0.99, 0.92), detail);
-    snow = mix(snow, vec3(0.62, 0.67, 0.69), smoothstep(0.58, 0.88, slope) * 0.24);
-    vec3 sediment = mix(vec3(0.42, 0.36, 0.27), vec3(0.70, 0.64, 0.51), medium);
+    vec4 eco = ecoAt(p);
+    float flow = eco.r;
+    float curv = eco.g;
+    float forestDensity = eco.b;
+    float svf = eco.a;
+    float convex = clamp((0.5 - curv) * 2.0, 0.0, 1.0);
+    float concave = clamp((curv - 0.5) * 2.0, 0.0, 1.0);
 
-    float rockMask = smoothstep(0.24, 0.58, slope);
-    float cliffMask = smoothstep(0.48, 0.82, slope);
-    float alpineMask = smoothstep(0.24, 0.52, height01);
     float materialId = vSurface.x;
-    float snowMask = clamp(vSurface.y, 0.0, 1.0);
+    float snowMass = clamp(vSurface.y, 0.0, 1.0);
     float iceMask = clamp(vSurface.z, 0.0, 1.0);
     float surfaceTempC = vSurface.w;
 
-    vec3 base = mix(grass, alpine, alpineMask);
-    base = mix(base, rock, rockMask);
-    base = mix(base, cliff, cliffMask);
-    base = mix(base, sediment, smoothstep(1.5, 2.5, materialId) * (1.0 - smoothstep(2.5, 3.5, materialId)));
-    base = mix(base, snow, snowMask);
-    base = mix(base, vec3(0.70, 0.86, 0.96), iceMask * 0.72);
+    float horiz = length(gN.xz);
+    float northness = (horiz > 0.0001) ? (-gN.z / horiz) : 0.0;
+    northness *= clamp(slope * 8.0, 0.0, 1.0);
 
+    float wet = flow * (1.0 - smoothstep(0.06, 0.20, slope));
+    float drainage = smoothstep(0.35, 0.75, flow);
+    // Masks. Rock on steep and convex ground; scree below cliffs and above the meadows;
+    // forest from the ecology map; marsh where water collects on flat ground; snow from
+    // the surface state, shed from steep faces and held in gullies.
+    float rock = smoothstep(0.30, 0.48, slope + convex * 0.08 + (fine - 0.5) * 0.10);
+    float scree = (1.0 - rock) * smoothstep(0.14, 0.28, slope) * smoothstep(0.28, 0.55, height01 + (broad - 0.5) * 0.12);
+    scree = max(scree, (1.0 - rock) * smoothstep(0.50, 0.72, height01 + (medium - 0.5) * 0.10) * 0.75);
+    float forest = smoothstep(0.10, 0.55, forestDensity) * (1.0 - rock);
+    float marsh = smoothstep(0.42, 0.80, flow) * (1.0 - smoothstep(0.02, 0.07, slope)) * (1.0 - forest * 0.6);
+    float snow = snowMass * (1.0 - smoothstep(0.42, 0.62, slope + (fine - 0.5) * 0.08 - concave * 0.06));
+    snow = max(snow, snowMass * concave * 0.5);
+    snow = clamp(snow + smoothstep(0.88, 0.98, height01) * (1.0 - smoothstep(0.55, 0.75, slope)) * 0.6, 0.0, 1.0);
+
+    // Compose textured materials as layered "over" operations.
+    vec2 tn;
+    vec2 tnAcc;
+    vec3 base = material(2.0, vWorldPos, gN, ntVar, tnAcc);
+    {
+        float dry = smoothstep(0.35, 0.75, medium * 0.6 + convex * 0.3 + height01 * 0.4 - wet * 0.5);
+        vec3 tint = mix(vec3(0.86, 0.98, 0.70), vec3(0.92, 0.86, 0.60), dry);
+        float gl = dot(base, vec3(0.3, 0.59, 0.11));
+        base = mix(vec3(gl), base, 0.78) * tint;
+    }
+    if (marsh > 0.03) {
+        vec3 c = material(5.0, vWorldPos, gN, ntVar, tn) * vec3(0.95, 0.98, 0.85);
+        base = mix(base, c, marsh); tnAcc = mix(tnAcc, tn, marsh);
+    }
+    if (forest > 0.03) {
+        vec3 c = material(3.0, vWorldPos, gN, ntVar, tn);
+        float canopy = fbm(p * 0.45);
+        c *= vec3(0.22, 0.36, 0.17) * (0.70 + 0.6 * canopy) * (1.0 - drainage * 0.25);
+        base = mix(base, c, forest); tnAcc = mix(tnAcc, tn + (canopy - 0.5) * 0.4, forest);
+    }
+    if (scree > 0.03) {
+        vec3 c = material(1.0, vWorldPos, gN, ntVar, tn);
+        float sl = dot(c, vec3(0.3, 0.59, 0.11));
+        // Scree reads grey: pull the tan photo toward luminance and cool it.
+        c = mix(vec3(sl), c, 0.30) * vec3(0.80, 0.83, 0.86) * mix(1.0, 0.88, smoothstep(0.5, 0.8, height01));
+        base = mix(base, c, scree); tnAcc = mix(tnAcc, tn, scree);
+    }
+    if (rock > 0.03) {
+        vec3 c = material(0.0, vWorldPos, gN, ntVar, tn);
+        float strata = fbm(vec2(vWorldPos.x * 0.08, vWorldPos.y * 0.55));
+        float rl = dot(c, vec3(0.3, 0.59, 0.11));
+        // Bare rock is grey with a cool cast; only the strata bands keep a little warmth.
+        c = mix(vec3(rl), c, 0.35) * vec3(0.86, 0.88, 0.92);
+        c *= mix(0.80, 1.16, strata);
+        c = mix(c, c * vec3(1.06, 1.0, 0.94), strata * 0.3);
+        base = mix(base, c, rock); tnAcc = mix(tnAcc, tn, rock);
+    }
+    if (snow > 0.03) {
+        vec3 c = material(4.0, vWorldPos, gN, ntVar, tn) * 1.05;
+        base = mix(base, c, snow); tnAcc = mix(tnAcc, tn * 0.5, snow);
+    }
+    base = mix(base, vec3(0.70, 0.86, 0.96), iceMask * 0.72);
+    // Cavity shading and wet ground.
+    base *= 1.0 - concave * 0.16 + convex * 0.05;
+    base *= 1.0 - drainage * 0.10 * (1.0 - snow);
+    base *= 1.0 - wet * 0.20 * (1.0 - snow);
+    // Texture normals perturb the shading normal (UDN blend).
+    n = normalize(vec3(gN.x + tnAcc.x * 0.55, gN.y, gN.z + tnAcc.y * 0.55));
+    halfDir = normalize(lightDir + viewDir);
+
+    // Cut faces of the box: rock texture side-projected under strata bands.
     float stratum = smoothstep(0.42, 0.58, noise(vec2(vWorldPos.y * 1.15, vUv.x * 8.0 + vUv.y * 5.0)));
     float layer = smoothstep(0.47, 0.53, sin(vWorldPos.y * 1.7 + broad * 2.8) * 0.5 + 0.5);
     float cutDepth = clamp((vWorldPos.y + 5.0) / (heightScale + 8.0), 0.0, 1.0);
@@ -184,28 +326,35 @@ void main()
     vec3 cutMaterial = mix(compactEarth, weatheredStone, cutDepth);
     cutMaterial = mix(cutMaterial, paleLayer, layer * 0.24);
     cutMaterial = mix(cutMaterial, darkLayer, (1.0 - cutDepth) * 0.22 + stratum * 0.12);
-    cutMaterial *= 0.86 + fine * 0.12;
-    // Dark topsoil band just under the surface so the wall meets the terrain with soil,
-    // not a pale weathered-stone stripe.
+    {
+        float along = dot(vWorldPos.xz, vec2(abs(gN.z), abs(gN.x)));
+        vec3 rockTex = texture(matAlbedo, vec3(vec2(along, vWorldPos.y) / (u.material.x * 0.35), 0.0)).rgb;
+        float rl = dot(rockTex, vec3(0.3, 0.59, 0.11));
+        cutMaterial *= mix(0.7, 1.35, rl);
+    }
     float below = max(terrainH(vWorldPos.xz) - vWorldPos.y, 0.0);
     cutMaterial = mix(vec3(0.135, 0.112, 0.085), cutMaterial, smoothstep(0.4, 3.0, below));
     cutMaterial = mix(cutMaterial, vec3(0.08, 0.085, 0.08), bottomFace);
 
-    float wet = 0.0;
+    vec3 sediment = mix(vec3(0.42, 0.36, 0.27), vec3(0.70, 0.64, 0.51), medium);
+    float wetWash = 0.0;
     if (cutFace > 0.5) {
         base = cutMaterial;
+        n = gN;
+        svf = 0.6;
+        forestDensity = 0.0;
     } else {
         base = mix(base, sediment, clamp(vHydro.y * sedimentTint * showSediment, 0.0, 0.46));
-        base *= 0.86 + fine * 0.22 + broad * 0.10;
-
         float routeWater = smoothstep(0.22, 0.92, vHydro.x) * waterTint;
         float pocketWater = smoothstep(waterLevel - 0.006, waterLevel + 0.003, waterLevel - height01)
                           * smoothstep(0.48, 0.82, vHydro.x) * 0.18;
-        wet = clamp((routeWater + pocketWater) * showWater, 0.0, 1.0);
+        wetWash = clamp((routeWater + pocketWater) * showWater, 0.0, 1.0);
         vec3 washColor = mix(vec3(0.58, 0.62, 0.60), vec3(0.72, 0.76, 0.73), broad);
         vec3 channelColor = mix(washColor, vec3(0.44, 0.55, 0.57), smoothstep(0.78, 1.0, vHydro.x));
-        base = mix(base, channelColor, wet * 0.54);
+        base = mix(base, channelColor, wetWash * 0.54);
     }
+    wet = max(wet * 0.6, wetWash);
+    float snowMask = snow;
 
     float diff = max(dot(n, lightDir), 0.0);
     float rim = pow(max(1.0 - dot(n, viewDir), 0.0), 2.2);
@@ -215,6 +364,10 @@ void main()
 
     // Cast shadows: terrain self-shadowing + cloud shadows attenuate direct sun only.
     float sunVis = sunTerrainShadow(vWorldPos, lightDir) * cloudShadow(vWorldPos, lightDir);
+    // Forest canopy blocks most direct sun and part of the sky on the floor beneath it.
+    float canopyBlock = smoothstep(0.08, 0.45, forestDensity);
+    sunVis *= 1.0 - canopyBlock * 0.72;
+    svf *= 1.0 - canopyBlock * 0.45;
 
     // Sky ambient follows the day/night clock, and the moon brightens the night in
     // proportion to its phase and elevation.
@@ -224,7 +377,7 @@ void main()
     float moonAmb = litFrac * smoothstep(0.0, 0.25, md.y) * (1.0 - daylight);
     vec3 ambient = mix(vec3(0.020, 0.028, 0.048) * (0.7 + 2.4 * moonAmb), vec3(0.15, 0.18, 0.22), daylight);
     // slight extra skylight on upward-facing surfaces
-    ambient *= 0.75 + 0.25 * clamp(n.y, 0.0, 1.0);
+    ambient *= (0.75 + 0.25 * clamp(n.y, 0.0, 1.0)) * mix(0.55, 1.0, svf);
 
     vec3 color = base * (ambient + u.sunColor.xyz * diff * shade * sunVis);
     // faint directional moonlight so full-moon nights model the peaks
