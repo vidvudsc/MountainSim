@@ -856,7 +856,8 @@ private:
     void drawVegetation(VkCommandBuffer cmd)
     {
         const Vegetation::DrawGroups& g = vegGroups_[currentFrame_];
-        std::uint32_t total = g.conifer[1] + g.broadleaf[1] + g.boulder[1] + g.billboard[1] + g.grass[1] + g.fern[1] + g.mossRock[1];
+        std::uint32_t total = g.coniferMid[1] + g.broadleafMid[1] + g.boulder[1] + g.billboard[1] + g.grass[1] + g.fern[1] + g.mossRock[1] + g.flower[1];
+        for (int v = 0; v < Vegetation::kVariants; ++v) total += g.conifer[v][1] + g.broadleaf[v][1];
         if (!showVegetation_ || total == 0) return;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vegPipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
@@ -868,13 +869,15 @@ private:
             if (grp[1] == 0) return;
             vkCmdDrawIndexed(cmd, m.indexCount, grp[1], m.firstIndex, m.vertexOffset, grp[0]);
         };
-        draw(veg_.conifer, g.conifer);
-        draw(veg_.broadleaf, g.broadleaf);
+        for (int v = 0; v < Vegetation::kVariants; ++v) { draw(veg_.conifer[v], g.conifer[v]); draw(veg_.broadleaf[v], g.broadleaf[v]); }
+        draw(veg_.coniferMid, g.coniferMid);
+        draw(veg_.broadleafMid, g.broadleafMid);
         draw(veg_.boulder, g.boulder);
         draw(veg_.billboard, g.billboard);
         draw(veg_.grass, g.grass);
         draw(veg_.fern, g.fern);
         draw(veg_.mossRock, g.mossRock);
+        draw(veg_.flower, g.flower);
     }
 
     void createSkyPipeline()
@@ -2259,7 +2262,7 @@ private:
         ubo.shadowParams = glm::vec4(sunShadows_ ? 1.0f : 0.0f,
                                      (cloudShadows_ && anyCloud) ? 1.0f : 0.0f, moonPhase_, cloudDetail_);
         ubo.material = glm::vec4(texMacro_, texMid_, texNear_, static_cast<float>(kTerrainSize));
-        ubo.quality = glm::vec4(quality_, 1.0f);
+        ubo.quality = glm::vec4(quality_, static_cast<float>(glfwGetTime()));
         void* data = nullptr;
         vkMapMemory(device_, uniformMemories_[frame], 0, sizeof(ubo), 0, &data);
         std::memcpy(data, &ubo, sizeof(ubo));

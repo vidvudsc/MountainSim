@@ -23,8 +23,11 @@ layout(set = 0, binding = 0) uniform SceneUniforms {
     vec4 lightning;
     vec4 shadowParams;
     vec4 material;
+    vec4 quality;   // w = time
 } u;
 layout(set = 0, binding = 3) uniform sampler2D heightTex;
+
+float hash2(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
 
 layout(location = 0) out vec3 vWorldPos;
 layout(location = 1) out vec3 vNormal;
@@ -67,6 +70,26 @@ void main()
     vec3 p = inPosition * s;
     vec3 rp = vec3(c * p.x + sn * p.z, p.y, -sn * p.x + c * p.z);
     vec3 world = inPosScale.xyz + rp;
+    // Wind: a slow gust field over the map plus a faster flutter, bending with height.
+    {
+        float time = u.quality.w;
+        vec2 windDir = normalize(vec2(0.8, 0.45));
+        float phase = dot(inPosScale.xz, windDir) * 0.35;
+        float gust = 0.55 + 0.45 * sin(time * 0.7 - phase) * sin(time * 0.23 - phase * 0.3 + 1.7);
+        float h01 = clamp(inPosition.y * 60.0, 0.0, 1.0);
+        float t = inRotType.y;
+        float amp, flutter;
+        if (t < 1.5) {          // trees: crown sways, trunk base fixed
+            amp = (s / 60.0) * 0.025;               // crown moves ~2.5% of the tree height
+            flutter = sin(time * 2.1 + hash2(inPosScale.xz) * 6.28 + inPosition.y * 60.0 * 0.4) * 0.25;
+        } else if (t > 3.5 && t < 5.5 || t > 6.5) {   // grass, ferns, flowers
+            amp = 0.0045;
+            flutter = sin(time * 3.3 + hash2(inPosScale.xz) * 6.28) * 0.6;
+        } else { amp = 0.0; flutter = 0.0; }
+        float bend = h01 * h01 * amp * (gust + flutter);
+        world.xz += windDir * bend;
+        if (t < 1.5) world.y -= bend * 0.3;
+    }
     vec3 n = inNormal;
     vNormal = normalize(vec3(c * n.x + sn * n.z, n.y, -sn * n.x + c * n.z));
     vWorldPos = world;

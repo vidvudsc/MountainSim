@@ -422,6 +422,7 @@ void main()
 
     // Fog with sun-tinted inscatter: haze glows warm when looking toward the sun.
     float dist = length(u.cameraPos.xyz - vWorldPos);
+    fogDensity += forestDensity * 0.0025;   // forest haze under canopy, matched in veg.frag
     float fog = fogDensity <= 0.00001 ? 0.0 : clamp(1.0 - exp(-dist * fogDensity), 0.0, 0.92);
     float sunAmount = max(dot(-viewDir, lightDir), 0.0);
     vec3 fogCol = mix(u.fogColor.xyz, u.sunColor.xyz, 0.55 * pow(sunAmount, 6.0));
